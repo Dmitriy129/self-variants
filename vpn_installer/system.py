@@ -85,16 +85,24 @@ def check_clean_host(instance):
     for path in (Path('/etc/ufw/user.rules'), Path('/etc/ufw/user6.rules')):
         if path.exists() and re.search(r'^-A ufw-user-input ', path.read_text(), re.M):
             raise InstallError('Найдены пользовательские правила UFW. Нужен чистый VPS.')
-    for folder in (Path('/etc/nginx/sites-enabled'), Path('/etc/nginx/conf.d')):
+    for folder in (Path('/etc/nginx/sites-enabled'), Path('/etc/nginx/conf.d'), Path('/etc/nginx/stream-conf.d')):
         if folder.exists() and any(p.name != 'default' for p in folder.iterdir()):
             raise InstallError('Найдена существующая конфигурация Nginx. Нужен чистый VPS.')
+    nginx_main = Path('/etc/nginx/nginx.conf')
+    if nginx_main.exists():
+        content = nginx_main.read_text()
+        unquoted = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\#[^\n]*''', '', content)
+        if re.search(r'\bstream\s*\{', unquoted) or '# BEGIN vpn-installer stream' in content:
+            raise InstallError('Найдена существующая stream-конфигурация Nginx. Нужен чистый VPS.')
     check_free_ports(instance)
 
 
 def check_free_ports(instance):
-    listeners = [(80, socket.SOCK_STREAM), (instance['https_port'], socket.SOCK_STREAM),
+    listeners = {(80, socket.SOCK_STREAM), (instance['https_port'], socket.SOCK_STREAM),
                  (2053, socket.SOCK_STREAM), (2096, socket.SOCK_STREAM),
-                 (443, socket.SOCK_STREAM if instance['profile'] == 'reality' else socket.SOCK_DGRAM)]
+                 (443, socket.SOCK_STREAM if instance['profile'] == 'reality' else socket.SOCK_DGRAM)}
+    if instance.get('site'):
+        listeners.update((port, socket.SOCK_STREAM) for port in (7443, 9443, 10443))
     for port, kind in listeners:
         for family, address in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
             try:
@@ -117,7 +125,7 @@ def check_dns(domain, runner=run):
     local = {ipaddress.ip_address(a['local']) for iface in interfaces for a in iface.get('addr_info', [])}
     if not addresses or not addresses.issubset(local):
         raise InstallError('Все A/AAAA домена должны указывать на публичные адреса этого VPS. '
-                           'Для установки до смены DNS используйте --prepare. NAT/CDN в v1 не поддерживаются.')
+                           'Для установки до смены DNS используйте --prepare. NAT/CDN не поддерживаются.')
 
 
 def check_reality_target(instance):
@@ -254,7 +262,7 @@ def install_dependencies(runner=run):
     env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
     runner(['apt-get', 'update'], env=env)
     runner(['apt-get', 'install', '-y', '--no-install-recommends', 'ca-certificates',
-            'nginx', 'certbot', 'openssl', 'ufw', 'iproute2'], env=env)
+            'nginx', 'libnginx-mod-stream', 'certbot', 'openssl', 'ufw', 'iproute2'], env=env)
 
 
 def bootstrap_panel(instance, runner=run):

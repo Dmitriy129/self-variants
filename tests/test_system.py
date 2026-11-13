@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import socket
 import sqlite3
+import ssl
 import stat
 import subprocess
 import tarfile
@@ -19,8 +20,16 @@ import zipfile
 from vpn_installer import system
 
 
-def instance(profile="reality"):
-    return {"profile": profile, "https_port": 8443}
+def instance(profile="reality", version=1):
+    data = {"profile": profile, "https_port": 8443, "schema_version": version}
+    if profile == "reality":
+        data["reality"] = {"target": "www.example.org:443", "server_name": "www.example.org"}
+    if version == 2:
+        data["https_port"] = 443
+        if profile == "reality":
+            data["site"] = {"domain": "journal.example.org", "template": "field-notes"}
+            data["reality"].update(target="127.0.0.1:9443", server_name="journal.example.org")
+    return data
 
 
 def versions(payload=b"verified archive"):
@@ -51,6 +60,7 @@ class HostChecks(unittest.TestCase):
             ({"/etc/ufw/user.rules"}, {"/etc/ufw/user.rules": "-A ufw-user-input -p tcp --dport 1234 -j ACCEPT\n"}),
             ({"/etc/ufw/user6.rules"}, {"/etc/ufw/user6.rules": "-A ufw-user-input -p tcp --dport 1234 -j ACCEPT\n"}),
             ({"/etc/nginx/conf.d"}, {}),
+            ({"/etc/nginx/stream-conf.d"}, {}),
         )
         for present, contents in cases:
             with self.subTest(present=present), \
@@ -65,6 +75,27 @@ class HostChecks(unittest.TestCase):
     def test_clean_host_still_checks_ports(self):
         with mock.patch.object(Path, "exists", return_value=False), mock.patch.object(system, "check_free_ports") as ports:
             system.check_clean_host(instance())
+        ports.assert_called_once()
+
+    def test_clean_host_rejects_main_stream_block_or_orphaned_marker_before_ports(self):
+        for content in ("events {}\nhttp {}\nstream { server { listen 4444; } }\n",
+                        "events {}\nhttp {}\n# BEGIN vpn-installer stream\n"):
+            with self.subTest(content=content), \
+                    mock.patch.object(Path, "exists", autospec=True,
+                                      side_effect=lambda path: str(path) == "/etc/nginx/nginx.conf"), \
+                    mock.patch.object(Path, "read_text", return_value=content), \
+                    mock.patch.object(system, "check_free_ports") as ports, \
+                    self.assertRaises(system.InstallError):
+                system.check_clean_host(instance("reality", 2))
+            ports.assert_not_called()
+
+    def test_clean_host_ignores_commented_or_quoted_stream_words(self):
+        content = '# stream { ignored }\nevents {}\nhttp { log_format custom "stream { text"; }\n'
+        with mock.patch.object(Path, "exists", autospec=True,
+                               side_effect=lambda path: str(path) == "/etc/nginx/nginx.conf"), \
+                mock.patch.object(Path, "read_text", return_value=content), \
+                mock.patch.object(system, "check_free_ports") as ports:
+            system.check_clean_host(instance("reality", 2))
         ports.assert_called_once()
 
     def test_port_checks_cover_ipv6_and_profile_transport(self):
@@ -99,6 +130,89 @@ class HostChecks(unittest.TestCase):
         runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps([{"addr_info": [{"local": "203.0.113.10"}]}])))
         with mock.patch.object(system.socket, "getaddrinfo", return_value=dns), self.assertRaises(system.InstallError):
             system.check_dns("vpn.example.com", runner)
+
+    def test_v2_port_checks_include_each_public_and_backend_listener(self):
+        for profile in ("reality", "hysteria2"):
+            bindings = []
+            def factory(family, kind):
+                probe = mock.MagicMock()
+                probe.__enter__.return_value = probe
+                probe.bind.side_effect = lambda address: bindings.append((family, kind, address[1]))
+                return probe
+            with self.subTest(profile=profile), mock.patch.object(system.socket, "socket", side_effect=factory):
+                system.check_free_ports(instance(profile, 2))
+            tcp_ports = {80, 443, 2053, 2096}
+            if profile == "reality":
+                tcp_ports.update((7443, 9443, 10443))
+            expected = {(family, socket.SOCK_STREAM, port)
+                        for family in (socket.AF_INET, socket.AF_INET6) for port in tcp_ports}
+            if profile == "hysteria2":
+                expected.update((family, socket.SOCK_DGRAM, 443) for family in (socket.AF_INET, socket.AF_INET6))
+            self.assertEqual(set(bindings), expected)
+            self.assertEqual(len(bindings), len(expected))
+
+    def test_v2_occupied_backend_refuses_install_for_either_address_family(self):
+        for occupied_family in (socket.AF_INET, socket.AF_INET6):
+            for occupied_port in (7443, 9443, 10443):
+                def factory(family, kind):
+                    probe = mock.MagicMock()
+                    probe.__enter__.return_value = probe
+                    def bind(address):
+                        if family == occupied_family and address[1] == occupied_port:
+                            raise OSError(errno.EADDRINUSE, "occupied backend")
+                    probe.bind.side_effect = bind
+                    return probe
+                with self.subTest(family=occupied_family, port=occupied_port), \
+                        mock.patch.object(system.socket, "socket", side_effect=factory), \
+                        self.assertRaisesRegex(system.InstallError, str(occupied_port)):
+                    system.check_free_ports(instance("reality", 2))
+
+    def test_reality_target_probe_connects_locally_but_authenticates_site_hostname(self):
+        for version, expected_address, expected_sni in (
+            (1, ("www.example.org", 443), "www.example.org"),
+            (2, ("127.0.0.1", 9443), "journal.example.org"),
+        ):
+            context = mock.MagicMock()
+            connection = context.wrap_socket.return_value.__enter__.return_value
+            connection.selected_alpn_protocol.return_value = "h2"
+            raw_socket = mock.MagicMock()
+            with self.subTest(version=version), \
+                    mock.patch.object(system.ssl, "create_default_context", return_value=context), \
+                    mock.patch.object(system.socket, "create_connection", return_value=raw_socket) as connect:
+                system.check_reality_target(instance("reality", version))
+            connect.assert_called_once_with(expected_address, timeout=12)
+            context.wrap_socket.assert_called_once_with(raw_socket.__enter__.return_value, server_hostname=expected_sni)
+            self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_3)
+            context.set_alpn_protocols.assert_called_once_with(["h2"])
+
+    def test_local_reality_probe_rejects_untrusted_tls_or_missing_http2(self):
+        for error in (None, ssl.SSLError("certificate mismatch")):
+            context = mock.MagicMock()
+            connection = context.wrap_socket.return_value.__enter__.return_value
+            connection.selected_alpn_protocol.return_value = "http/1.1"
+            context.wrap_socket.side_effect = error
+            with self.subTest(error=error), \
+                    mock.patch.object(system.ssl, "create_default_context", return_value=context), \
+                    mock.patch.object(system.socket, "create_connection", return_value=mock.MagicMock()), \
+                    self.assertRaises(system.InstallError):
+                system.check_reality_target(instance("reality", 2))
+
+    def test_hysteria_has_no_reality_probe(self):
+        with mock.patch.object(system.ssl, "create_default_context") as tls, \
+                mock.patch.object(system.socket, "create_connection") as connect:
+            system.check_reality_target(instance("hysteria2", 2))
+        tls.assert_not_called()
+        connect.assert_not_called()
+
+    def test_dependencies_include_dynamic_nginx_stream_module(self):
+        runner = mock.Mock()
+        system.install_dependencies(runner)
+        packages = runner.call_args_list[1].args[0]
+        self.assertEqual(packages[:3], ["apt-get", "install", "-y"])
+        self.assertIn("nginx", packages)
+        self.assertIn("libnginx-mod-stream", packages)
+        self.assertIn("certbot", packages)
+        self.assertEqual(runner.call_args.kwargs["env"]["DEBIAN_FRONTEND"], "noninteractive")
 
 
 class ArtifactTests(unittest.TestCase):

@@ -23,10 +23,14 @@ from typing import Any
 import uuid
 
 
-SCHEMA_VERSION = 1
-HTTPS_PORT = 8443
+SCHEMA_VERSION = 2
+HTTPS_PORT = 443
+LEGACY_HTTPS_PORT = 8443
+SITE_TEMPLATES = ("field-notes", "ceramic-studio", "trail-journal", "reading-room")
+LOCAL_REALITY_TARGET = "127.0.0.1:9443"
 _MAX_INTEGER = 2**63 - 1
 _MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_USERS = 10000
 _PATH = re.compile(r"/(?:[A-Za-z0-9_-]+/)+\Z", re.ASCII)
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{8,128}\Z", re.ASCII)
 _USERNAME = re.compile(r"[A-Za-z0-9_.@-]{1,64}\Z", re.ASCII)
@@ -97,6 +101,27 @@ def _password(value: Any, field: str) -> str:
     return value
 
 
+def _user_name(value: Any, field: str) -> str:
+    """3x-ui's email field is an identifier, not necessarily a mailbox."""
+    name = _text(value, field, 254)
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ConfigError(f"{field} must not contain whitespace or control characters")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ConfigError(f"{field} must contain valid UTF-8 characters") from None
+    return name
+
+
+def _user_names(value: Any) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= _MAX_USERS:
+        raise ConfigError("user names must be a nonempty array with at most 10000 entries")
+    names = [_user_name(name, f"user_names[{index}]") for index, name in enumerate(value)]
+    if len({name.casefold() for name in names}) != len(names):
+        raise ConfigError("user names must be unique, ignoring case")
+    return names
+
+
 def _key(value: Any, field: str) -> bytes:
     value = _text(value, field, 43)
     if not re.fullmatch(r"[A-Za-z0-9_-]{43}", value, re.ASCII):
@@ -152,23 +177,53 @@ def _target(value: Any) -> tuple[str, int]:
     return host, int(port)
 
 
+def monitoring_settings(mode: str = "basic") -> dict:
+    """Defaults for explicitly managed monitoring, never inferred on restore."""
+    if mode not in ("basic", "destinations"):
+        raise ConfigError("monitoring mode must be basic or destinations")
+    return {"mode": mode, "retention_days": 7, "max_log_mb": 128}
+
+
+def _monitoring(value: Any) -> None:
+    value = _fields(value, {"mode", "retention_days", "max_log_mb"}, "monitoring")
+    monitoring_settings(value["mode"])
+    for key, minimum, maximum in (("retention_days", 1, 30), ("max_log_mb", 16, 1024)):
+        if type(value[key]) is not int or not minimum <= value[key] <= maximum:
+            raise ConfigError(f"monitoring.{key} must be an integer from {minimum} to {maximum}")
+
+
 def validate_instance(data: Any) -> dict:
     """Return a detached copy, rejecting rather than repairing any invalid data."""
     if not isinstance(data, dict):
         raise ConfigError("instance must be an object")
-    if type(data.get("schema_version")) is not int or data["schema_version"] != SCHEMA_VERSION:
-        raise ConfigError("schema_version must be the integer 1")
+    version = data.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
+        raise ConfigError("schema_version must be the integer 1 or 2")
     profile = data.get("profile")
     if profile not in ("reality", "hysteria2"):
         raise ConfigError("profile must be reality or hysteria2")
     fields = {"schema_version", "profile", "domain", "email", "https_port", "panel", "subscription", "users"}
+    # Older portable files have no monitoring field. Preserve them as-is.
+    if "monitoring" in data:
+        fields.add("monitoring")
+        _monitoring(data["monitoring"])
     if profile == "reality":
         fields.add("reality")
+        if version == 2:
+            fields.add("site")
     _fields(data, fields, "instance")
     _domain(data["domain"], "domain")
     _email(data["email"], "email")
-    if type(data["https_port"]) is not int or data["https_port"] != HTTPS_PORT:
-        raise ConfigError("https_port must be the integer 8443")
+    expected_port = LEGACY_HTTPS_PORT if version == 1 else HTTPS_PORT
+    if type(data["https_port"]) is not int or data["https_port"] != expected_port:
+        raise ConfigError(f"https_port must be the integer {expected_port} for schema {version}")
+    if version == 2 and profile == "reality":
+        site = _fields(data["site"], {"domain", "template"}, "site")
+        _domain(site["domain"], "site.domain")
+        if site["domain"] == data["domain"]:
+            raise ConfigError("site.domain must differ from the management domain")
+        if site["template"] not in SITE_TEMPLATES:
+            raise ConfigError("site.template must name a built-in site template")
 
     panel = _fields(data["panel"], {"path", "username", "password"}, "panel")
     subscription = _fields(data["subscription"], {"path"}, "subscription")
@@ -182,7 +237,7 @@ def validate_instance(data: Any) -> dict:
     _password(panel["password"], "panel.password")
 
     users = data["users"]
-    if not isinstance(users, list) or len(users) > 10000:
+    if not isinstance(users, list) or len(users) > _MAX_USERS:
         raise ConfigError("users must be an array with at most 10000 entries")
     emails: set[str] = set()
     sub_ids: set[str] = set()
@@ -191,11 +246,7 @@ def validate_instance(data: Any) -> dict:
     for index, user in enumerate(users):
         field = f"users[{index}]"
         _fields(user, {"email", "sub_id", "enable", "expiry_time", "total_gb", "limit_ip", credential}, field)
-        # 3x-ui calls this field email, but it is a user identifier and the
-        # panel normally generates names without an @ or a mailbox domain.
-        name = _text(user["email"], f"{field}.email", 254)
-        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in name):
-            raise ConfigError(f"{field}.email must not contain whitespace or control characters")
+        _user_name(user["email"], f"{field}.email")
         if not isinstance(user["sub_id"], str) or not _TOKEN.fullmatch(user["sub_id"]):
             raise ConfigError(f"{field}.sub_id must contain 8 to 128 ASCII letters, digits, _ or -")
         if type(user["enable"]) is not bool:
@@ -219,8 +270,13 @@ def validate_instance(data: Any) -> dict:
 
     if profile == "reality":
         reality = _fields(data["reality"], {"target", "server_name", "private_key", "public_key", "short_id"}, "reality")
-        _target(reality["target"])
+        if version == 1:
+            _target(reality["target"])
+        elif reality["target"] != LOCAL_REALITY_TARGET:
+            raise ConfigError("schema 2 reality.target must be 127.0.0.1:9443")
         _domain(reality["server_name"], "reality.server_name")
+        if version == 2 and reality["server_name"] != data["site"]["domain"]:
+            raise ConfigError("reality.server_name must equal site.domain")
         private = _key(reality["private_key"], "reality.private_key")
         public = _key(reality["public_key"], "reality.public_key")
         if not isinstance(reality["short_id"], str) or not re.fullmatch(r"(?:[0-9a-f]{2}){1,8}", reality["short_id"], re.ASCII):
@@ -231,37 +287,56 @@ def validate_instance(data: Any) -> dict:
 
 
 def new_instance(profile: str, domain: str, email: str, reality_target: str | None = None,
-                 admin_password: str | None = None) -> dict:
-    """Create fresh credentials; this is the only manifest generation entry point."""
+                 admin_password: str | None = None, *, site_domain: str | None = None,
+                 site_template: str | None = None, user_names: list[str] | None = None,
+                 monitoring_mode: str = "basic") -> dict:
+    """Create a schema 2 deployment. Existing schema 1 files are restore-only."""
     if profile not in ("reality", "hysteria2"):
         raise ConfigError("profile must be reality or hysteria2")
     _domain(domain, "domain")
     _email(email, "email")
-    if profile != "reality" and reality_target is not None:
-        raise ConfigError("reality_target is only supported for the reality profile")
+    if reality_target is not None:
+        raise ConfigError("new deployments use a local site; reality_target is only stored in legacy manifests")
+    if profile == "reality":
+        _domain(site_domain, "site.domain")
+        if site_domain == domain:
+            raise ConfigError("site.domain must differ from the management domain")
+        if site_template not in (None, "random") and site_template not in SITE_TEMPLATES:
+            raise ConfigError("site.template must name a built-in site template")
+    elif site_domain is not None or site_template is not None:
+        raise ConfigError("site options are only supported for the reality profile")
     if admin_password is not None:
         _password(admin_password, "panel.password")
+    # Validate the entire startup list before generating any identities.
+    names = _user_names([f"personal@{domain}"] if user_names is None else user_names)
+    monitoring = monitoring_settings(monitoring_mode)
     data = {
         "schema_version": SCHEMA_VERSION, "profile": profile, "domain": domain,
         "email": email, "https_port": HTTPS_PORT,
+        "monitoring": monitoring,
         "panel": {"path": f"/{secrets.token_urlsafe(18)}/", "username": "admin",
                   "password": admin_password if admin_password is not None else secrets.token_urlsafe(24)},
         "subscription": {"path": "/sub/"},
-        "users": [{"email": f"personal@{domain}", "sub_id": secrets.token_urlsafe(18),
-                   "enable": True, "expiry_time": 0, "total_gb": 0, "limit_ip": 0}],
+        "users": [{"email": name, "sub_id": secrets.token_urlsafe(18),
+                   "enable": True, "expiry_time": 0, "total_gb": 0, "limit_ip": 0}
+                  for name in names],
     }
     if profile == "reality":
-        target = reality_target if reality_target is not None else "www.microsoft.com:443"
-        server_name, _ = _target(target)
+        # Resolve once during creation; manifests only store concrete slugs so
+        # export, retries and restore never choose a different page.
+        selected_template = secrets.choice(SITE_TEMPLATES) if site_template in (None, "random") else site_template
+        data["site"] = {"domain": site_domain, "template": selected_template}
         private_der = _openssl("genpkey", "-algorithm", "X25519", "-outform", "DER")
         private = _raw_der(private_der, _PRIVATE_DER_PREFIX)
-        data["reality"] = {"target": target, "server_name": server_name,
+        data["reality"] = {"target": LOCAL_REALITY_TARGET, "server_name": site_domain,
                            "private_key": _encode_key(private),
                            "public_key": _encode_key(_public_from_private(private)),
                            "short_id": secrets.token_hex(8)}
-        data["users"][0]["uuid"] = str(uuid.uuid4())
+        for user in data["users"]:
+            user["uuid"] = str(uuid.uuid4())
     else:
-        data["users"][0]["password"] = secrets.token_urlsafe(24)
+        for user in data["users"]:
+            user["password"] = secrets.token_urlsafe(24)
     return validate_instance(data)
 
 
@@ -285,6 +360,32 @@ def load_instance(path: str | os.PathLike[str]) -> dict:
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise ConfigError("manifest is not valid UTF-8 JSON") from None
     return validate_instance(data)
+
+
+def load_user_names(path: str | os.PathLike[str]) -> list[str]:
+    """Read a startup-only JSON array; restoring a manifest never calls this."""
+    with open(path, "rb") as source:
+        raw = source.read(_MAX_MANIFEST_BYTES + 1)
+    if len(raw) > _MAX_MANIFEST_BYTES:
+        raise ConfigError("user names file exceeds the 1 MiB size limit")
+    try:
+        names = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise ConfigError("user names file is not valid UTF-8 JSON") from None
+    return _user_names(names)
+
+
+def parse_user_names(value: str) -> list[str]:
+    """Parse startup-only CLI names; identifiers are validated before generation."""
+    if not isinstance(value, str):
+        raise ConfigError('user names must be a comma-separated string within 1 MiB')
+    try:
+        length = len(value.encode('utf-8'))
+    except UnicodeEncodeError:
+        raise ConfigError('user names must be valid UTF-8') from None
+    if length > _MAX_MANIFEST_BYTES:
+        raise ConfigError('user names must be a comma-separated string within 1 MiB')
+    return _user_names([name.strip() for name in value.split(',')])
 
 
 def save_instance(path: str | os.PathLike[str], data: Any) -> None:
@@ -315,10 +416,26 @@ def save_instance(path: str | os.PathLike[str], data: Any) -> None:
 def subscription_urls(instance: Any) -> dict[str, str]:
     """Return each user's stable native subscription URL, including disabled users."""
     data = validate_instance(instance)
-    base = f"https://{data['domain']}:{data['https_port']}{data['subscription']['path']}"
+    base = public_origin(data) + data["subscription"]["path"]
     return {user["email"]: base + user["sub_id"] for user in data["users"]}
 
 
 def panel_url(instance: Any) -> str:
     data = validate_instance(instance)
-    return f"https://{data['domain']}:{data['https_port']}{data['panel']['path']}"
+    return public_origin(data) + data["panel"]["path"]
+
+
+def public_origin(instance: dict) -> str:
+    """Render the management origin of an already validated manifest exactly."""
+    if instance["schema_version"] == 1 and instance["https_port"] == LEGACY_HTTPS_PORT:
+        return f"https://{instance['domain']}:{LEGACY_HTTPS_PORT}"
+    if instance["schema_version"] == 2 and instance["https_port"] == HTTPS_PORT:
+        return f"https://{instance['domain']}"
+    raise ConfigError("Unsupported schema and public port combination")
+
+
+def vpn_domain(instance: dict) -> str:
+    """Return the advertised VPN host, separate from management for v2 REALITY."""
+    if instance["schema_version"] == 2 and instance["profile"] == "reality":
+        return instance["site"]["domain"]
+    return instance["domain"]

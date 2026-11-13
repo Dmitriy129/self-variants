@@ -1,6 +1,8 @@
 """Boundary and command-order tests; these never change host services."""
 
 from pathlib import Path
+import copy
+import os
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +17,15 @@ def instance(profile="reality"):
         "panel": {"path": "/panel_random/"},
         "subscription": {"path": "/sub/"},
     }
+
+
+def modern_instance(profile="reality"):
+    data = instance(profile)
+    data.update(schema_version=2, https_port=443)
+    if profile == "reality":
+        data["site"] = {"domain": "notes.example.com", "template": "field-notes"}
+        data["reality"] = {"target": "127.0.0.1:9443"}
+    return data
 
 
 class Recorder:
@@ -32,6 +43,95 @@ class Recorder:
 
 
 class RenderingTests(unittest.TestCase):
+    def test_v2_reality_uses_sni_router_and_private_tls_backends(self):
+        data = modern_instance()
+        http = network.render_nginx(data)
+        stream = network.render_stream(data)
+        self.assertIn("listen 127.0.0.1:7443 ssl proxy_protocol;", http)
+        self.assertIn("listen 127.0.0.1:9443 ssl http2;", http)
+        self.assertNotIn("listen 443", http)
+        self.assertNotIn("listen [::]:443", http)
+        self.assertNotIn("listen 10443", http)
+        self.assertEqual(http.count("ssl_reject_handshake on;"), 2)
+        self.assertIn("set_real_ip_from 127.0.0.1;", http)
+        self.assertIn("real_ip_header proxy_protocol;", http)
+        self.assertIn("proxy_set_header X-Forwarded-Port 443;", http)
+        self.assertNotIn("$server_port", http)
+        self.assertIn("/etc/letsencrypt/live/vpn.example.com/fullchain.pem", http)
+        self.assertIn("/etc/letsencrypt/live/notes.example.com/fullchain.pem", http)
+        site = http[http.index("server_name notes.example.com;", http.index("map $http_upgrade")):]
+        self.assertIn("root /var/www/vpn-site;", site)
+        self.assertNotIn("proxy_protocol", site)
+        self.assertNotIn("proxy_pass", site)
+        self.assertIn("vpn.example.com 127.0.0.1:7443;", stream)
+        self.assertIn("notes.example.com 127.0.0.1:10443;", stream)
+        self.assertIn("default 127.0.0.1:7443;", stream)
+        self.assertIn("listen 443;", stream)
+        self.assertIn("listen [::]:443;", stream)
+        self.assertIn("ssl_preread on;", stream)
+        self.assertIn("proxy_protocol on;", stream)
+        self.assertNotIn("ssl_reject_handshake", stream)
+        self.assertNotIn("ssl_certificate", stream)
+
+    def test_v2_hysteria_management_owns_tcp443_without_stream_or_site(self):
+        data = modern_instance("hysteria2")
+        text = network.render_nginx(data)
+        self.assertIn("listen 443 ssl;", text)
+        self.assertIn("listen [::]:443 ssl;", text)
+        self.assertIn("ssl_reject_handshake on;", text)
+        self.assertNotIn("proxy_protocol", text)
+        self.assertNotIn("9443", text)
+        self.assertNotIn("root /var/www/vpn-site", text)
+        self.assertEqual(network.render_stream(data), "")
+        self.assertEqual(network.render_stream(instance()), "")
+
+    def test_v2_http_bootstrap_has_both_acme_hosts_and_safe_redirects(self):
+        text = network.render_nginx(modern_instance(), tls_enabled=False)
+        self.assertEqual(text.count("/.well-known/acme-challenge/"), 2)
+        self.assertIn("return 301 https://vpn.example.com$request_uri;", text)
+        self.assertIn("return 301 https://notes.example.com$request_uri;", text)
+        self.assertIn("if ($host != notes.example.com) { return 404; }", text)
+        self.assertNotIn("listen 443", text)
+        self.assertNotIn("ssl_certificate", text)
+        self.assertNotIn("proxy_pass", text)
+
+    def test_v2_rejects_domain_overlap_bad_templates_and_wrong_ports(self):
+        original = modern_instance()
+        variants = []
+        for domain in (original["domain"], "127.0.0.1", "../site", "a.com;evil", "a.com\n"):
+            data = copy.deepcopy(original)
+            data["site"]["domain"] = domain
+            variants.append(data)
+        for template in ("../outside", "missing", None):
+            data = copy.deepcopy(original)
+            data["site"]["template"] = template
+            variants.append(data)
+        for version in (True, 0, 3, "2"):
+            data = copy.deepcopy(original)
+            data["schema_version"] = version
+            variants.append(data)
+        data = copy.deepcopy(original)
+        data["https_port"] = 8443
+        variants.append(data)
+        data = copy.deepcopy(original)
+        data.pop("site")
+        variants.append(data)
+        data = modern_instance("hysteria2")
+        data["site"] = original["site"]
+        variants.append(data)
+        for data in variants:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                network.render_nginx(data)
+
+    def test_v2_reality_hook_reloads_both_lineages_restarts_only_site(self):
+        script = network.render_renew_hook(modern_instance())
+        self.assertIn("/etc/letsencrypt/live/vpn.example.com) ;;", script)
+        self.assertIn("/etc/letsencrypt/live/notes.example.com) restart_core=yes ;;", script)
+        self.assertIn('if [ "$restart_core" = yes ]; then', script)
+        self.assertLess(script.index("nginx -t"), script.index("reload nginx"))
+        self.assertLess(script.index("reload nginx"), script.index("restart x-ui"))
+        subprocess.run(["/bin/sh", "-n"], input=script, text=True, check=True)
+
     def test_only_management_https_and_original_uris_are_proxied(self):
         text = network.render_nginx(instance())
         self.assertIn("listen 8443 ssl;", text)
@@ -110,6 +210,130 @@ class ExecutionTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name).resolve()
         self.runner = Recorder()
+
+    def main_config(self, text="include /etc/nginx/modules-enabled/*.conf;\nevents {}\nhttp {}\n"):
+        path = self.root / "etc/nginx/nginx.conf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_v2_stream_main_include_is_top_level_idempotent_and_preserves_unrelated_text(self):
+        original = "# untouched\ninclude /etc/nginx/modules-enabled/*.conf;\nevents {}\nhttp { # stream { ignored comment\n}\n"
+        main = self.main_config(original)
+        main.chmod(0o444)
+        network.configure_https(modern_instance(), self.runner, self.root)
+        first = main.read_text()
+        self.assertTrue(first.startswith(original))
+        self.assertIn("stream {\n    include /etc/nginx/stream-conf.d/vpn-installer.conf;\n}", first)
+        self.assertEqual(main.stat().st_mode & 0o777, 0o444)
+        network.configure_https(modern_instance(), self.runner, self.root)
+        self.assertEqual(main.read_text(), first)
+        self.assertEqual(first.count("# BEGIN vpn-installer stream"), 1)
+        self.assertIn("ssl_preread on;", (self.root / "etc/nginx/stream-conf.d/vpn-installer.conf").read_text())
+        network.configure_http(modern_instance(), self.runner, self.root)
+        self.assertEqual(main.read_text(), original)
+        self.assertFalse((self.root / "etc/nginx/stream-conf.d/vpn-installer.conf").exists())
+        self.assertNotIn("listen 443", (self.root / "etc/nginx/conf.d/vpn-installer.conf").read_text())
+
+    def test_v2_failed_nginx_test_rolls_back_all_managed_files_and_modes(self):
+        main = self.main_config()
+        old_main = main.read_bytes()
+        config = self.root / "etc/nginx/conf.d/vpn-installer.conf"
+        stream = self.root / "etc/nginx/stream-conf.d/vpn-installer.conf"
+        for path, text in ((config, "old http"), (stream, "old stream")):
+            path.parent.mkdir(parents=True)
+            path.write_text(text)
+            path.chmod(0o444)
+        runner = Recorder(fail=["nginx", "-t"])
+        with self.assertRaises(subprocess.CalledProcessError):
+            network.configure_https(modern_instance(), runner, self.root)
+        self.assertEqual(main.read_bytes(), old_main)
+        self.assertEqual(config.read_text(), "old http")
+        self.assertEqual(stream.read_text(), "old stream")
+        self.assertEqual(config.stat().st_mode & 0o777, 0o444)
+        self.assertEqual(stream.stat().st_mode & 0o777, 0o444)
+        self.assertEqual(runner.calls, [["nginx", "-t"]])
+        self.assertFalse((self.root / "etc/letsencrypt/renewal-hooks").exists())
+
+    def test_v2_reload_failure_restores_prior_main_and_removes_new_includes(self):
+        main = self.main_config()
+        previous = main.read_bytes()
+        runner = Recorder(fail=["systemctl", "reload", "nginx"])
+        with self.assertRaises(subprocess.CalledProcessError):
+            network.configure_https(modern_instance(), runner, self.root)
+        self.assertEqual(main.read_bytes(), previous)
+        self.assertFalse((self.root / "etc/nginx/conf.d/vpn-installer.conf").exists())
+        self.assertFalse((self.root / "etc/nginx/stream-conf.d/vpn-installer.conf").exists())
+
+    def test_v2_unmanaged_or_malformed_stream_is_refused_without_changes(self):
+        for original in ("events {}\nhttp {}\nstream {}\n", "# BEGIN vpn-installer stream\n"):
+            with self.subTest(original=original):
+                main = self.main_config(original)
+                with self.assertRaises(ValueError):
+                    network.configure_https(modern_instance(), self.runner, self.root)
+                self.assertEqual(main.read_text(), original)
+                self.assertFalse((self.root / "etc/nginx/conf.d/vpn-installer.conf").exists())
+        self.assertEqual(self.runner.calls, [])
+
+    def test_v2_certificates_are_separate_named_lineages(self):
+        network.issue_certificate(modern_instance(), self.runner, self.root)
+        self.assertEqual(len(self.runner.calls), 2)
+        for args, domain in zip(self.runner.calls, ("vpn.example.com", "notes.example.com")):
+            self.assertEqual(args[args.index("--cert-name") + 1], domain)
+            self.assertEqual(args[args.index("--domain") + 1], domain)
+            self.assertEqual(args.count("--domain"), 1)
+
+    def test_v2_firewall_exposes_only_selected_public_ports_after_ssh(self):
+        for profile in ("reality", "hysteria2"):
+            with self.subTest(profile=profile):
+                runner = Recorder()
+                network.configure_firewall(modern_instance(profile), [2222], runner, self.root)
+                expected = [["ufw", "allow", "2222/tcp"], ["ufw", "allow", "80/tcp"],
+                            ["ufw", "allow", "443/tcp"]]
+                if profile == "hysteria2":
+                    expected.append(["ufw", "allow", "443/udp"])
+                self.assertEqual(runner.calls[:-3], expected)
+
+    def test_static_page_is_public_readable_and_preserves_edited_readonly_file(self):
+        templates = self.root / "templates"
+        source = templates / "field-notes/index.html"
+        source.parent.mkdir(parents=True)
+        source.write_text("<!doctype html><title>Fixture</title>")
+        source.chmod(0o444)
+        previous_umask = os.umask(0o077)
+        try:
+            target = network.install_static_site(modern_instance(), templates, self.root)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(source.stat().st_mode & 0o777, 0o444)
+        for folder in (target.parent, target.parent.parent):
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o755)
+        target.write_text("owner's edited page")
+        target.chmod(0o444)
+        source.unlink()
+        self.assertEqual(network.install_static_site(modern_instance(), templates, self.root), target)
+        self.assertEqual(target.read_text(), "owner's edited page")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o444)
+        self.assertIsNone(network.install_static_site(modern_instance("hysteria2"), templates, self.root))
+        self.assertIsNone(network.install_static_site(instance(), templates, self.root))
+
+    def test_static_page_rejects_target_and_source_symlinks(self):
+        outside = self.root / "outside.html"
+        outside.write_text("unrelated")
+        target = self.root / "var/www/vpn-site/index.html"
+        target.parent.mkdir(parents=True)
+        target.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            network.install_static_site(modern_instance(), self.root / "templates", self.root)
+        target.unlink()
+        source = self.root / "templates/field-notes/index.html"
+        source.parent.mkdir(parents=True)
+        source.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            network.install_static_site(modern_instance(), self.root / "templates", self.root)
+        self.assertEqual(outside.read_text(), "unrelated")
 
     def test_http_setup_validates_before_starting(self):
         path = network.configure_http(instance(), self.runner, self.root)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+from contextlib import ExitStack
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -32,9 +33,10 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vpn_installer.config import new_instance, validate_instance
-from vpn_installer.network import render_nginx
-from vpn_installer.panel import PanelClient, configure_instance, export_instance
+from vpn_installer.config import new_instance, validate_instance, subscription_urls, vpn_domain
+from vpn_installer import monitoring
+from vpn_installer.network import render_nginx, render_stream, install_static_site
+from vpn_installer.panel import PanelClient, apply_monitoring, configure_instance, export_instance, validate_monitoring
 from vpn_installer.system import digest_file, download_artifacts, install_binaries, read_versions
 
 
@@ -113,12 +115,13 @@ def ready_port(port):
 
 
 def prepare_certificates(work):
-    certdir = Path("/etc/letsencrypt/live") / DOMAIN
-    certdir.mkdir(parents=True)
-    cert, key = certdir / "fullchain.pem", certdir / "privkey.pem"
-    run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-         "-keyout", str(key), "-out", str(cert), "-subj", f"/CN={DOMAIN}",
-         "-addext", f"subjectAltName=DNS:{DOMAIN},DNS:{TARGET}"])
+    for domain in (DOMAIN, TARGET):
+        certdir = Path("/etc/letsencrypt/live") / domain
+        certdir.mkdir(parents=True)
+        cert, key = certdir / "fullchain.pem", certdir / "privkey.pem"
+        run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-keyout", str(key), "-out", str(cert), "-subj", f"/CN={domain}",
+             "-addext", f"subjectAltName=DNS:{domain}"])
     with Path("/etc/hosts").open("a") as hosts:
         hosts.write(f"\n127.0.0.1 {DOMAIN} {TARGET}\n")
     return cert, key
@@ -140,9 +143,17 @@ def artifacts_from(directory, work):
     return artifacts
 
 
-def test_instance(profile):
+def test_instance(profile, version):
     instance = new_instance(profile, DOMAIN, "owner@example.test",
-                            reality_target=f"{TARGET}:9443" if profile == "reality" else None)
+                            site_domain=TARGET if profile == "reality" else None)
+    if version == 1:
+        instance.update(schema_version=1, https_port=8443)
+        instance.pop("site", None)
+        instance.pop("monitoring", None)
+        if profile == "reality":
+            instance["reality"].update(target=f"{TARGET}:9443", server_name=TARGET)
+    else:
+        instance['monitoring']['mode'] = 'destinations'
     # Test multiple independently portable users and both boolean states.
     for index in (2, 3):
         user = copy.deepcopy(instance["users"][0])
@@ -158,7 +169,8 @@ def test_instance(profile):
 def launch_panel(app, database, instance, logfile):
     database.mkdir(mode=0o700)
     env = dict(os.environ, XUI_DB_FOLDER=str(database), XUI_BIN_FOLDER=str(app / "bin"),
-               XUI_LOG_FOLDER=str(database / "logs"), XUI_LOG_LEVEL="warning",
+               XUI_LOG_FOLDER="/var/log/x-ui" if instance.get('monitoring') else str(database / "logs"),
+               XUI_LOG_LEVEL="warning",
                XRAY_LOCATION_ASSET=str(app / "bin"))
     run([str(app / "x-ui"), "setting", "-listenIP", "127.0.0.1", "-port", "2053",
          "-webBasePath", instance["panel"]["path"], "-username", instance["panel"]["username"],
@@ -173,9 +185,8 @@ def login(instance):
 
 def get_subscription(instance, user):
     request = urllib.request.Request(
-        "http://127.0.0.1:2096" + instance["subscription"]["path"] + user["sub_id"],
-        headers={"Host": instance["domain"], "User-Agent": "v2rayNG/1.10.0"})
-    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=3) as response:
+        subscription_urls(instance)[user["email"]], headers={"User-Agent": "v2rayNG/1.10.0"})
+    with https_opener(DOMAIN).open(request, timeout=3) as response:
         raw = response.read().strip()
     decoded = base64.b64decode(raw, validate=True).decode()
     uris = [line for line in decoded.splitlines() if line]
@@ -184,7 +195,7 @@ def get_subscription(instance, user):
     uri = urllib.parse.urlsplit(uris[0])
     credential = urllib.parse.unquote(uri.username or "")
     expected = user["uuid"] if instance["profile"] == "reality" else user["password"]
-    if uri.hostname != DOMAIN or uri.port != 443 or credential != expected:
+    if uri.hostname != vpn_domain(instance) or uri.port != 443 or credential != expected:
         raise RuntimeError("subscription address or identity differs from the manifest")
     if uri.scheme not in (("vless",) if instance["profile"] == "reality" else ("hysteria2", "hy2")):
         raise RuntimeError("subscription uses an unexpected protocol")
@@ -210,12 +221,54 @@ def check_core_running(client):
     return True
 
 
-def check_nginx(work, instance):
+def https_opener(domain):
+    context = ssl.create_default_context(cafile=str(Path("/etc/letsencrypt/live") / domain / "fullchain.pem"))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+
+
+def check_public_site(instance):
+    if "site" not in instance:
+        return
+    with https_opener(TARGET).open(f"https://{TARGET}/", timeout=3) as response:
+        page = response.read()
+    expected = (Path(__file__).resolve().parents[1] / "sites" / instance["site"]["template"] / "index.html").read_bytes()
+    if page != expected:
+        raise RuntimeError("ordinary HTTPS request did not reach the selected static site")
+    for path in (instance["panel"]["path"], instance["subscription"]["path"]):
+        try:
+            https_opener(TARGET).open(f"https://{TARGET}{path}", timeout=3)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                continue
+            raise
+        raise RuntimeError("management route was exposed on the site domain")
+    # Unknown SNI must not present the management certificate or reach a UI.
+    context = ssl._create_unverified_context()
+    with socket.create_connection(("127.0.0.1", 443), timeout=3) as raw:
+        try:
+            with context.wrap_socket(raw, server_hostname="unknown.example.test"):
+                pass
+        except ssl.SSLError:
+            return
+    raise RuntimeError("unknown SNI was accepted by the public listener")
+
+
+def nginx_config(work, instance, tls_enabled=True):
     include = work / "nginx-include.conf"
     main = work / "nginx.conf"
-    main.write_text(f"pid {work}/nginx.pid;\nerror_log /dev/null;\nevents {{}}\nhttp {{ include {include}; }}\n")
+    stream = render_stream(instance) if tls_enabled else ""
+    main.write_text("include /etc/nginx/modules-enabled/*.conf;\n"
+                    f"pid {work}/nginx.pid;\nerror_log /dev/null;\nevents {{}}\n"
+                    f"http {{ include /etc/nginx/mime.types; include {include}; }}\n"
+                    + (f"stream {{\n{stream}\n}}\n" if stream else ""))
+    include.write_text(render_nginx(instance, tls_enabled=tls_enabled))
+    return main
+
+
+def check_nginx(work, instance):
+    work.mkdir(exist_ok=True)
     for enabled in (False, True):
-        include.write_text(render_nginx(instance, tls_enabled=enabled))
+        main = nginx_config(work, instance, enabled)
         run(["nginx", "-t", "-c", str(main)])
 
 
@@ -231,6 +284,7 @@ def configure_export(app, work, profile, instance, number):
     empty_export = None
     with ManagedProcess([str(app / "x-ui")], work / f"panel-{profile}-{number}-restart.log", cwd=app, env=env) as process:
         client = wait_for(lambda: login(instance), "restarted panel API", process)
+        configure_instance(client, instance)  # A repeated run keeps live users and normalized Hosts.
         exported = validate_instance(export_instance(client, instance))
         if exported != instance:
             raise RuntimeError("API export did not preserve all portable identities and limits")
@@ -242,6 +296,18 @@ def configure_export(app, work, profile, instance, number):
         data = wait_for(lambda: generated_config(app, profile, empty=not instance["users"]),
                         "generated Xray configuration", process)
         wait_for(lambda: check_core_running(client), "panel Xray health status", process)
+        if instance.get('monitoring'):
+            # Exercise the real form-based API, retaining all users and URLs.
+            basic = copy.deepcopy(instance)
+            basic['monitoring']['mode'] = 'basic'
+            apply_monitoring(client, basic)
+            validate_monitoring(client, basic)
+            if export_instance(client, basic)['users'] != instance['users']:
+                raise RuntimeError('changing monitoring modified live users')
+            apply_monitoring(client, instance)
+            validate_monitoring(client, instance)
+            if export_instance(client, instance) != instance:
+                raise RuntimeError('restoring monitoring changed portable settings')
         runtime_json = json.dumps(data)
         for user in instance["users"]:
             credential = user.get("uuid", user.get("password"))
@@ -250,7 +316,8 @@ def configure_export(app, work, profile, instance, number):
         path = work / f"server-{profile}-{number}.json"
         path.write_text(json.dumps(data))
         run([str(app / "bin/xray-linux-amd64"), "run", "-test", "-config", str(path)], cwd=app, env=env)
-        check_nginx(work, instance)
+        check_nginx(work / "syntax", instance)
+        wait_for(lambda: check_public_site(instance), "public static site and SNI isolation", process)
         if number == 2:
             for user in instance["users"]:
                 client._request("POST", "panel/api/clients/del/" + urllib.parse.quote(user["email"], safe=""), {})
@@ -337,7 +404,7 @@ def request_through_tunnel():
 
 def tunnel_test(app, work, profile, server_config, subscriptions, env):
     server = copy.deepcopy(server_config)
-    server["log"] = {"loglevel": "warning"}
+    server.setdefault("log", {})["loglevel"] = "warning"
     # The production template correctly blocks private destinations.  This
     # single exact test route permits only our local HTTP fixture.
     server.setdefault("outbounds", []).append({
@@ -380,23 +447,49 @@ def main():
             thread = threading.Thread(target=fixture.serve_forever, daemon=True)
             thread.start()
             try:
-                with ManagedProcess(["openssl", "s_server", "-accept", "9443", "-cert", str(cert),
-                                     "-key", str(key), "-tls1_3", "-alpn", "h2,http/1.1", "-www"],
-                                    work / "reality-target.log") as target:
-                    wait_for(lambda: ready_port(9443), "local TLS 1.3 REALITY target", target)
+                for version in (1, 2):
                     for profile in ("reality", "hysteria2"):
-                        original = test_instance(profile)
-                        exported, first_urls, _, _, _ = configure_export(app, work, profile, original, 1)
-                        restored, second_urls, runtime, env, empty = configure_export(app, work, profile, exported, 2)
-                        if restored != original or first_urls != second_urls:
-                            raise RuntimeError("fresh database restore changed identities or subscription URIs")
-                        print(f"PASS: {profile}: real panel API, Base64 subscriptions, exact clean-DB restore, Xray config and Nginx syntax", flush=True)
-                        tunnel_test(app, work, profile, runtime, second_urls, env)
-                        print(f"PASS: {profile}: both enabled subscription identities carried HTTP through real Xray over IPv4 and IPv6", flush=True)
-                        empty_restored, empty_urls, _, _, _ = configure_export(app, work, profile, empty, 3)
-                        if empty_restored["users"] or empty_urls:
-                            raise RuntimeError("empty restore resurrected deleted users")
-                        print(f"PASS: {profile}: deleting all users and restoring their empty export preserved revocation", flush=True)
+                        case = work / f"v{version}-{profile}"
+                        case.mkdir()
+                        original = test_instance(profile, version)
+                        if original.get('monitoring'):
+                            # Only inside the disposable container; no systemd is running.
+                            monitoring.configure(original, runner=lambda *a, **kw: subprocess.CompletedProcess(a, 0))
+                            Path('/var/log/x-ui/access.log').write_bytes(b'')
+                        with ExitStack() as stack:
+                            if version == 1 and profile == "reality":
+                                target = stack.enter_context(ManagedProcess(
+                                    ["openssl", "s_server", "-accept", "9443", "-cert", str(cert),
+                                     "-key", str(key), "-tls1_3", "-alpn", "h2,http/1.1", "-www"],
+                                    case / "reality-target.log"))
+                                wait_for(lambda: ready_port(9443), "legacy REALITY target", target)
+                            install_static_site(original)
+                            main_config = nginx_config(case, original)
+                            run(["nginx", "-t", "-c", str(main_config)])
+                            front = stack.enter_context(ManagedProcess(
+                                ["nginx", "-c", str(main_config), "-g", "daemon off;"], case / "nginx.log"))
+                            wait_for(lambda: ready_port(original["https_port"]), "public Nginx HTTPS listener", front)
+                            exported, first_urls, _, _, _ = configure_export(app, case, profile, original, 1)
+                            restored, second_urls, runtime, env, empty = configure_export(app, case, profile, exported, 2)
+                            if restored != original or first_urls != second_urls or subscription_urls(restored) != subscription_urls(original):
+                                raise RuntimeError("fresh database restore changed identities or subscription URLs")
+                            print(f"PASS: v{version} {profile}: real panel API, public HTTPS subscriptions, exact clean-DB restore and site routing", flush=True)
+                            tunnel_test(app, case, profile, runtime, second_urls, env)
+                            print(f"PASS: v{version} {profile}: both subscription identities carried HTTP through real Xray over IPv4 and IPv6", flush=True)
+                            if original.get('monitoring'):
+                                access = Path('/var/log/x-ui/access.log').read_text()
+                                for user in original['users']:
+                                    if user['enable'] and user['email'] not in access:
+                                        raise RuntimeError('real access log did not attribute traffic to a user')
+                                monitoring.collect(original['monitoring'])
+                                first_user = next(user for user in original['users'] if user['enable'])
+                                if not list(monitoring.history_lines(original['monitoring'], user=first_user['email'])):
+                                    raise RuntimeError('collector did not retain attributed real access records')
+                                print(f"PASS: v{version} {profile}: monitoring API mode changes preserved users; access records archived", flush=True)
+                            empty_restored, empty_urls, _, _, _ = configure_export(app, case, profile, empty, 3)
+                            if empty_restored["users"] or empty_urls:
+                                raise RuntimeError("empty restore resurrected deleted users")
+                            print(f"PASS: v{version} {profile}: empty export preserved revocation", flush=True)
             finally:
                 fixture.shutdown()
                 fixture.server_close()

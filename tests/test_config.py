@@ -1,5 +1,7 @@
 import base64
 import copy
+from contextlib import ExitStack
+import json
 from pathlib import Path
 import shutil
 import stat
@@ -8,12 +10,12 @@ import unittest
 from unittest import mock
 
 from vpn_installer.config import (
-    ConfigError, load_instance, new_instance, panel_url, save_instance,
-    subscription_urls, validate_instance,
+    ConfigError, load_instance, load_user_names, new_instance, panel_url, parse_user_names, save_instance,
+    public_origin, subscription_urls, validate_instance, vpn_domain, SITE_TEMPLATES,
 )
 
 
-def manifest(profile="hysteria2"):
+def manifest(profile="hysteria2", version=1):
     data = {
         "schema_version": 1, "profile": profile, "domain": "vpn.example.com",
         "email": "owner@example.com", "https_port": 8443,
@@ -36,10 +38,191 @@ def manifest(profile="hysteria2"):
             "short_id": "aabbccddeeff0011",
         }
         data["users"][0]["uuid"] = "f26544bf-882a-4cc0-a336-927bc2e938b5"
+    if version == 2:
+        data.update(schema_version=2, https_port=443)
+        if profile == "reality":
+            data["site"] = {"domain": "journal.example.org", "template": "field-notes"}
+            data["reality"].update(target="127.0.0.1:9443", server_name="journal.example.org")
     return data
 
 
 class ManifestTests(unittest.TestCase):
+    def test_cli_names_trim_separators_and_keep_valid_identifiers(self):
+        names = parse_user_names(" owner , мама,sister-phone,guest@example.org ")
+        self.assertEqual(names, ["owner", "мама", "sister-phone", "guest@example.org"])
+        self.assertEqual(parse_user_names("x" * 254), ["x" * 254])
+        for profile in ("reality", "hysteria2"):
+            options = {"site_domain": "journal.example.org"} if profile == "reality" else {}
+            with self.subTest(profile=profile):
+                instance = new_instance(profile, "vpn.example.com", "owner@example.com", user_names=names, **options)
+                self.assertEqual([user["email"] for user in instance["users"]], names)
+                self.assertEqual(len(set(subscription_urls(instance).values())), len(names))
+
+    def test_invalid_cli_names_are_rejected_before_identity_generation(self):
+        invalid = (None, ["owner"], "", " ", ",", "owner,", ",owner", "owner,,family",
+                   "owner,OWNER", "Мама,мама", "owner,two names", "owner,bad\nname",
+                   "owner,bad\x00name", "owner,bad\x7fname", "owner," + "x" * 255,
+                   "owner,\ud800", ",".join(str(index) for index in range(10001)),
+                   "x" * (1024 * 1024 + 1))
+        with ExitStack() as stack:
+            for target in ("secrets.token_urlsafe", "secrets.token_hex", "secrets.choice", "uuid.uuid4", "_openssl"):
+                stack.enter_context(mock.patch("vpn_installer.config." + target,
+                                               side_effect=AssertionError("invalid names must not generate identities")))
+            for index, value in enumerate(invalid):
+                with self.subTest(case=index), self.assertRaises(ConfigError):
+                    new_instance("hysteria2", "vpn.example.com", "owner@example.com",
+                                 user_names=parse_user_names(value))
+
+    def test_monitoring_is_explicit_and_portable_without_changing_urls_or_users(self):
+        for version in (1, 2):
+            for profile in ('reality', 'hysteria2'):
+                original = manifest(profile, version)
+                urls = subscription_urls(original)
+                self.assertNotIn('monitoring', validate_instance(original))
+                original['monitoring'] = {'mode': 'destinations', 'retention_days': 7, 'max_log_mb': 128}
+                with self.subTest(version=version, profile=profile), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / 'instance.json'
+                    save_instance(path, original)
+                    self.assertEqual(load_instance(path), original)
+                    self.assertEqual(subscription_urls(load_instance(path)), urls)
+
+    def test_incomplete_or_invalid_monitoring_is_never_repaired_on_restore(self):
+        valid = {'mode': 'basic', 'retention_days': 7, 'max_log_mb': 128}
+        invalid = [None, {}, {'mode': 'basic'}, dict(valid, unexpected=True), dict(valid, mode='all')]
+        for field, values in (('retention_days', (0, 31, True, '7')),
+                              ('max_log_mb', (0, 15, 1025, False, '128'))):
+            invalid.extend(dict(valid, **{field: value}) for value in values)
+        for value in invalid:
+            original = manifest()
+            original['monitoring'] = value
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                validate_instance(original)
+
+    def test_new_monitoring_defaults_and_invalid_choice_precede_identity_generation(self):
+        self.assertEqual(new_instance('hysteria2', 'vpn.example.com', 'owner@example.com')['monitoring'],
+                         {'mode': 'basic', 'retention_days': 7, 'max_log_mb': 128})
+        self.assertEqual(new_instance('hysteria2', 'vpn.example.com', 'owner@example.com',
+                                      monitoring_mode='destinations')['monitoring']['mode'], 'destinations')
+        with mock.patch('vpn_installer.config.secrets.token_urlsafe', side_effect=AssertionError('must validate first')), \
+                self.assertRaises(ConfigError):
+            new_instance('hysteria2', 'vpn.example.com', 'owner@example.com', monitoring_mode='all')
+
+    def test_startup_names_create_independent_portable_users_for_both_profiles(self):
+        for profile in ("reality", "hysteria2"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                names = ["dad", "мама", "sister-phone"]
+                options = {"site_domain": "journal.example.org"} if profile == "reality" else {}
+                original = new_instance(profile, "vpn.example.com", "owner@example.com",
+                                        user_names=names, **options)
+                self.assertEqual([user["email"] for user in original["users"]], names)
+                self.assertEqual(names, ["dad", "мама", "sister-phone"])
+                credential = "uuid" if profile == "reality" else "password"
+                self.assertEqual(len({user["sub_id"] for user in original["users"]}), len(names))
+                self.assertEqual(len({user[credential] for user in original["users"]}), len(names))
+                self.assertEqual(len(set(subscription_urls(original).values())), len(names))
+                for user in original["users"]:
+                    self.assertIs(user["enable"], True)
+                    self.assertEqual((user["expiry_time"], user["total_gb"], user["limit_ip"]), (0, 0, 0))
+                original["users"][1].update(enable=False, expiry_time=4102444800000,
+                                            total_gb=5 * 1024**3, limit_ip=2)
+                path = Path(directory) / "instance.json"
+                with ExitStack() as stack:
+                    for target in ("secrets.token_urlsafe", "secrets.token_hex", "secrets.choice",
+                                   "uuid.uuid4", "load_user_names", "parse_user_names"):
+                        stack.enter_context(mock.patch("vpn_installer.config." + target,
+                                                       side_effect=AssertionError("restore must reuse identities")))
+                    save_instance(path, original)
+                    restored = load_instance(path)
+                    self.assertEqual(restored, original)
+                    self.assertEqual(subscription_urls(restored), subscription_urls(original))
+
+    def test_startup_names_are_fully_validated_before_any_generation(self):
+        invalid_lists = ([], "dad", {"users": ["dad"]}, ["dad", "DAD"],
+                         ["Мама", "мама"], ["dad", ""], ["dad", 12],
+                         ["dad", "two names"], ["dad", "bad\nname"], ["dad", "bad\x00name"],
+                         ["dad", "bad\x7fname"], ["dad", "x" * 255], ["dad", "\ud800"],
+                         [str(index) for index in range(10001)])
+        with ExitStack() as stack:
+            for target in ("secrets.token_urlsafe", "secrets.token_hex", "secrets.choice", "uuid.uuid4", "_openssl"):
+                stack.enter_context(mock.patch("vpn_installer.config." + target,
+                                               side_effect=AssertionError("must validate all names first")))
+            for profile in ("reality", "hysteria2"):
+                options = {"site_domain": "journal.example.org"} if profile == "reality" else {}
+                for names in invalid_lists:
+                    with self.subTest(profile=profile, value_type=type(names).__name__, count=len(names)), self.assertRaises(ConfigError):
+                        new_instance(profile, "vpn.example.com", "owner@example.com", user_names=names, **options)
+
+    def test_startup_names_file_is_a_strict_utf8_array_of_unique_identifiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "users.json"
+            path.write_text('["dad", "мама", "sister-phone"]', encoding="utf-8")
+            self.assertEqual(load_user_names(path), ["dad", "мама", "sister-phone"])
+            cases = (
+                b'not-json', b'[]', b'null', b'"dad"', b'{"users":["dad"]}',
+                b'["dad", "DAD"]', b'["dad", false]', b'["dad", "two names"]',
+                b'["dad", "bad\\nname"]', b'["dad", "\\ud800"]', b'["dad", NaN]',
+                b'["dad", "\xff"]', b'\xef\xbb\xbf["dad"]', b'["dad"] trailing',
+            )
+            for raw in cases:
+                path.write_bytes(raw)
+                with self.subTest(raw=raw), self.assertRaises(ConfigError):
+                    load_user_names(path)
+            path.write_bytes(b" " * (1024 * 1024 + 1))
+            with self.assertRaisesRegex(ConfigError, "size limit"):
+                load_user_names(path)
+
+    def test_default_direct_api_still_creates_the_personal_user(self):
+        data = new_instance("hysteria2", "vpn.example.com", "owner@example.com")
+        self.assertEqual([user["email"] for user in data["users"]], ["personal@vpn.example.com"])
+
+    def test_v2_distinct_hosts_and_default_tls_port_survive_restore(self):
+        for profile in ("reality", "hysteria2"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                original = manifest(profile, 2)
+                path = Path(directory) / "portable.json"
+                with mock.patch("vpn_installer.config.secrets.token_urlsafe", side_effect=AssertionError("no generation")):
+                    save_instance(path, original)
+                    restored = load_instance(path)
+                self.assertEqual(restored, original)
+                self.assertEqual(public_origin(restored), "https://vpn.example.com")
+                self.assertEqual(panel_url(restored), "https://vpn.example.com/Panel_Kept-Exactly/nested/")
+                self.assertEqual(subscription_urls(restored), {
+                    "alice@example.com": "https://vpn.example.com/My_Sub/nested/Keep_This-Token01"})
+                self.assertEqual(vpn_domain(restored), "journal.example.org" if profile == "reality" else "vpn.example.com")
+
+    def test_v2_site_requires_distinct_dns_name_known_template_and_fixed_target(self):
+        for section, field, value in (
+            ("site", "domain", "vpn.example.com"), ("site", "domain", "127.0.0.1"),
+            ("site", "template", "../custom"), ("site", "template", "unknown"),
+            ("reality", "target", "journal.example.org:443"),
+            ("reality", "target", "127.0.0.1:443"),
+            ("reality", "server_name", "vpn.example.com"),
+        ):
+            data = manifest("reality", 2)
+            data[section][field] = value
+            with self.subTest(section=section, field=field, value=value), self.assertRaises(ConfigError):
+                validate_instance(data)
+        for template in SITE_TEMPLATES:
+            data = manifest("reality", 2)
+            data["site"]["template"] = template
+            self.assertEqual(validate_instance(data), data)
+
+    def test_version_specific_fields_and_ports_cannot_be_silently_migrated(self):
+        for profile, version in (("reality", 1), ("hysteria2", 1), ("hysteria2", 2)):
+            data = manifest(profile, version)
+            data["site"] = {"domain": "journal.example.org", "template": "field-notes"}
+            with self.subTest(profile=profile, version=version), self.assertRaises(ConfigError):
+                validate_instance(data)
+        data = manifest("reality", 2)
+        del data["site"]
+        with self.assertRaises(ConfigError):
+            validate_instance(data)
+        for version, wrong_port in ((1, 443), (2, 8443)):
+            data = manifest("hysteria2", version)
+            data["https_port"] = wrong_port
+            with self.subTest(version=version), self.assertRaises(ConfigError):
+                validate_instance(data)
+
     def test_panel_user_name_is_not_required_to_be_a_mailbox(self):
         data = manifest()
         data['users'][0]['email'] = 'phone-android-01'
@@ -136,7 +319,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_malformed_values_refused_without_normalization(self):
         changes = [
-            ("schema_version", True), ("schema_version", 2), ("https_port", True),
+            ("schema_version", True), ("schema_version", 3), ("https_port", True),
             ("https_port", 443), ("profile", "unknown"), ("domain", "example.com/path"),
             ("domain", "https://example.com"), ("domain", "127.0.0.1"),
             ("domain", "example.com."), ("domain", "*.example.com"),
@@ -214,6 +397,9 @@ class ManifestTests(unittest.TestCase):
         second = new_instance("hysteria2", "vpn.example.com", "owner@example.com", admin_password="ExplicitAdmin123!")
         self.assertEqual(second["panel"]["password"], "ExplicitAdmin123!")
         self.assertEqual(first["subscription"]["path"], "/sub/")
+        self.assertEqual(first["schema_version"], 2)
+        self.assertEqual(first["https_port"], 443)
+        self.assertNotIn("site", first)
         self.assertNotEqual(first["panel"]["path"], second["panel"]["path"])
         self.assertNotEqual(first["users"][0]["sub_id"], second["users"][0]["sub_id"])
         self.assertNotEqual(first["users"][0]["password"], second["users"][0]["password"])
@@ -228,11 +414,60 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(subscription_urls(load_instance(path)), subscription_urls(original))
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for REALITY")
-    def test_new_reality_has_matching_keys_and_explicit_target(self):
-        data = new_instance("reality", "vpn.example.com", "owner@example.com", reality_target="www.example.org:8443")
-        self.assertEqual(data["reality"]["target"], "www.example.org:8443")
-        self.assertEqual(data["reality"]["server_name"], "www.example.org")
+    def test_new_reality_has_matching_keys_and_local_site(self):
+        with mock.patch("vpn_installer.config.secrets.choice", side_effect=AssertionError("explicit template must not be randomized")):
+            data = new_instance("reality", "vpn.example.com", "owner@example.com",
+                                site_domain="journal.example.org", site_template="reading-room")
+        self.assertEqual(data["reality"]["target"], "127.0.0.1:9443")
+        self.assertEqual(data["reality"]["server_name"], "journal.example.org")
+        self.assertEqual(data["site"], {"domain": "journal.example.org", "template": "reading-room"})
+        self.assertEqual(data["schema_version"], 2)
         self.assertEqual(validate_instance(data), data)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for REALITY")
+    def test_default_and_random_template_are_selected_once_and_survive_restore(self):
+        for options in ({}, {"site_template": "random"}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                with mock.patch("vpn_installer.config.secrets.choice", return_value="ceramic-studio") as choose:
+                    data = new_instance("reality", "vpn.example.com", "owner@example.com",
+                                        site_domain="journal.example.org", **options)
+                    choose.assert_called_once_with(SITE_TEMPLATES)
+                self.assertEqual(data["site"]["template"], "ceramic-studio")
+                path = Path(directory) / "instance.json"
+                with mock.patch("vpn_installer.config.secrets.choice", side_effect=AssertionError("restore must not choose")):
+                    with mock.patch("vpn_installer.config.secrets.token_urlsafe", side_effect=AssertionError("restore must not generate")):
+                        save_instance(path, data)
+                        restored = load_instance(path)
+                        self.assertEqual(restored, data)
+                        self.assertEqual(subscription_urls(restored), subscription_urls(data))
+
+    def test_random_is_a_creation_option_not_a_portable_template(self):
+        data = manifest("reality", 2)
+        data["site"]["template"] = "random"
+        with mock.patch("vpn_installer.config.secrets.choice", side_effect=AssertionError("validation must not choose")):
+            with self.assertRaises(ConfigError):
+                validate_instance(data)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "instance.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaises(ConfigError):
+                    load_instance(path)
+
+    def test_hysteria_does_not_choose_a_site_and_rejects_explicit_site_options(self):
+        with mock.patch("vpn_installer.config.secrets.choice", side_effect=AssertionError("Hysteria has no site")):
+            self.assertNotIn("site", new_instance("hysteria2", "vpn.example.com", "owner@example.com"))
+            for template in ("random", "field-notes"):
+                with self.subTest(template=template), self.assertRaises(ConfigError):
+                    new_instance("hysteria2", "vpn.example.com", "owner@example.com", site_template=template)
+
+    def test_new_reality_site_errors_do_not_generate_any_credentials(self):
+        for options in ({}, {"site_domain": "vpn.example.com"},
+                        {"site_domain": "journal.example.org", "site_template": "not-a-template"},
+                        {"site_domain": "journal.example.org", "reality_target": "www.example.org:443"}):
+            with self.subTest(options=options):
+                with mock.patch("vpn_installer.config.secrets.token_urlsafe", side_effect=AssertionError("must validate first")):
+                    with self.assertRaises(ConfigError):
+                        new_instance("reality", "vpn.example.com", "owner@example.com", **options)
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for REALITY")
     def test_invalid_reality_keys_and_mismatch_are_rejected(self):

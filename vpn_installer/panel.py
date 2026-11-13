@@ -12,6 +12,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .config import LOCAL_REALITY_TARGET, public_origin, vpn_domain
+
+
+ACCESS_LOG_PATH = "/var/log/x-ui/access.log"
+_USER_STATS = ("statsUserUplink", "statsUserDownlink", "statsUserOnline")
+_INBOUND_STATS = ("statsInboundUplink", "statsInboundDownlink")
+
 
 class PanelError(RuntimeError):
     """An API or portability error, with no credentials in its message."""
@@ -40,12 +47,16 @@ class PanelClient:
             urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(self._cookies), _NoRedirect())
 
-    def _request(self, method, path, payload=None):
+    def _request(self, method, path, payload=None, *, form=False):
         headers = {"Accept": "application/json"}
         data = None
         if payload is not None:
-            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+            if form:
+                data = urllib.parse.urlencode(payload).encode("utf-8")
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+            else:
+                data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                headers["Content-Type"] = "application/json"
         if method not in ("GET", "HEAD"):
             if not self._csrf:
                 raise PanelError("Log in before changing panel settings")
@@ -96,6 +107,30 @@ class PanelClient:
         merged.update(deepcopy(settings))
         return self._request("POST", "panel/api/setting/update", merged)
 
+    def _get_xray_settings_response(self):
+        # Unlike AllSetting, this handler serializes the response object inside
+        # obj as a JSON string. The template is nested under xraySetting.
+        value = _json_object(self._request("POST", "panel/api/xray/", {}),
+                             "Xray settings response")
+        value["xraySetting"] = _json_object(value.get("xraySetting"), "xraySetting")
+        if not isinstance(value.get("outboundTestUrl"), str):
+            raise PanelError("Panel returned an invalid outbound test URL")
+        return value
+
+    def get_xray_settings(self):
+        return self._get_xray_settings_response()["xraySetting"]
+
+    def save_xray_settings(self, settings):
+        if not isinstance(settings, dict):
+            raise PanelError("Invalid Xray configuration template")
+        current = self._get_xray_settings_response()
+        # The pinned controller uses PostForm rather than binding JSON. Keep
+        # its separate outbound test URL unchanged when writing the template.
+        return self._request("POST", "panel/api/xray/update", {
+            "xraySetting": _dump(settings),
+            "outboundTestUrl": current["outboundTestUrl"],
+        }, form=True)
+
     def _list(self, path):
         value = self._request("GET", path)
         if not isinstance(value, list) or not all(isinstance(x, dict) for x in value):
@@ -107,6 +142,15 @@ class PanelClient:
 
     def list_clients(self):
         return self._list("panel/api/clients/list")
+
+    def list_hosts(self):
+        value = self._request("GET", "panel/api/hosts/raw")
+        # The pinned Go handler can serialize an empty slice as null.
+        if value is None:
+            return []
+        if not isinstance(value, list) or not all(isinstance(x, dict) for x in value):
+            raise PanelError("Panel returned invalid advertised hosts")
+        return value
 
     def get_client(self, email):
         value = self._request("GET", "panel/api/clients/get/" +
@@ -165,11 +209,19 @@ def _dump(value):
     return json.dumps(value, separators=(",", ":"))
 
 
+def _local_site(instance):
+    return instance["schema_version"] == 2 and instance["profile"] == "reality"
+
+
+def _external_proxy(instance):
+    return [{"dest": vpn_domain(instance), "port": 443, "forceTls": "same",
+             "remark": "vpn-installer-reality"}]
+
+
 def instance_settings(instance):
     """Only the settings owned by this installer; merge with live settings."""
     domain = instance["domain"]
-    prefix = "https://%s:%s%s" % (
-        domain, instance["https_port"], instance["subscription"]["path"])
+    prefix = public_origin(instance) + instance["subscription"]["path"]
     return {
         "webListen": "127.0.0.1", "webPort": 2053, "webDomain": "",
         "webBasePath": instance["panel"]["path"],
@@ -182,6 +234,84 @@ def instance_settings(instance):
         "subInfoNodeEnable": False,
         "trustedProxyCIDRs": "127.0.0.1/32,::1/128",
     }
+
+
+def _monitoring_log(mode):
+    if mode not in ("basic", "destinations"):
+        raise PanelError("Unsupported monitoring mode")
+    return {"access": ACCESS_LOG_PATH if mode == "destinations" else "none",
+            "error": "", "loglevel": "warning", "dnsLog": False, "maskAddress": ""}
+
+
+def _monitoring_policy(template, *, create):
+    """Return the level-zero and inbound policy without dropping other policy."""
+    if create:
+        template.setdefault("policy", {})
+    policy = _json_object(template.get("policy"), "policy")
+    if create:
+        policy.setdefault("levels", {})
+        policy.setdefault("system", {})
+    levels = _json_object(policy.get("levels"), "policy.levels")
+    if create:
+        levels.setdefault("0", {})
+    user = _json_object(levels.get("0"), "policy.levels.0")
+    system = _json_object(policy.get("system"), "policy.system")
+    # The API template contains nested objects, not JSON-encoded subfields.
+    # Assign them back so even an accepted legacy encoded object is normalized.
+    levels["0"] = user
+    policy.update(levels=levels, system=system)
+    template["policy"] = policy
+    return user, system
+
+
+def apply_monitoring(client, instance):
+    """Apply an explicitly managed mode without changing client identities.
+
+    Legacy manifests intentionally do not read or write the Xray template.
+    Retention is owned by the operating-system collector, not 3x-ui settings.
+    """
+    monitoring = instance.get("monitoring")
+    if monitoring is None:
+        return
+    expected_log = _monitoring_log(monitoring.get("mode"))
+    current = client.get_xray_settings()
+    desired = deepcopy(current)
+    existing_log = _json_object(desired.get("log", {}), "log")
+    if set(existing_log) - set(expected_log):
+        raise PanelError("Extra Xray log settings are outside managed monitoring")
+    desired["log"] = expected_log
+    desired.setdefault("stats", {})
+    _json_object(desired.get("stats"), "stats")
+    user, system = _monitoring_policy(desired, create=True)
+    user.update({field: True for field in _USER_STATS})
+    system.update({field: True for field in _INBOUND_STATS})
+    if desired != current:
+        client.save_xray_settings(desired)
+
+
+def validate_monitoring(client, instance):
+    """Validate live monitoring; changing its mode requires the installer CLI.
+
+    A panel-only mode change cannot synchronize archive collection or retention.
+    Reject it during export/repeat instead of writing a misleading manifest.
+    """
+    monitoring = instance.get("monitoring")
+    if monitoring is None:
+        return None
+    template = client.get_xray_settings()
+    log = _json_object(template.get("log"), "log")
+    access = log.get("access")
+    mode = {"none": "basic", ACCESS_LOG_PATH: "destinations"}.get(access) if isinstance(access, str) else None
+    if mode is None or log != _monitoring_log(mode):
+        raise PanelError("Xray logs changed outside managed monitoring")
+    if mode != monitoring.get("mode"):
+        raise PanelError("Monitoring mode differs; change it through the installer CLI")
+    _json_object(template.get("stats"), "stats")
+    user, system = _monitoring_policy(template, create=False)
+    if (any(user.get(field) is not True for field in _USER_STATS)
+            or any(system.get(field) is not True for field in _INBOUND_STATS)):
+        raise PanelError("Required client monitoring counters are disabled")
+    return deepcopy(monitoring)
 
 
 def build_inbound(instance):
@@ -220,6 +350,11 @@ def build_inbound(instance):
                              "serverName": reality["server_name"], "spiderX": "/"},
             },
         }
+        if _local_site(instance):
+            stream["sockopt"] = {"acceptProxyProtocol": True}
+            # v3.11 imports this into its normalized Hosts table on inbound
+            # creation. The public endpoint must not leak the internal port.
+            stream["externalProxy"] = _external_proxy(instance)
         protocol = "vless"
     else:
         cert_dir = "/etc/letsencrypt/live/" + instance["domain"]
@@ -234,13 +369,14 @@ def build_inbound(instance):
         }
         protocol = "hysteria"
     return {
-        "enable": True, "listen": "::", "port": 443,
+        "enable": True, "listen": "127.0.0.1" if _local_site(instance) else "::",
+        "port": 10443 if _local_site(instance) else 443,
         "protocol": protocol, "remark": "vpn-installer-" + profile,
         "tag": "vpn-installer-" + profile, "total": 0, "expiryTime": 0,
         "trafficReset": "never", "excludeFromSub": False,
         "settings": _dump(settings), "streamSettings": _dump(stream),
         "sniffing": _dump({"enabled": False}),
-        "shareAddrStrategy": "custom", "shareAddr": instance["domain"],
+        "shareAddrStrategy": "custom", "shareAddr": vpn_domain(instance),
     }
 
 
@@ -248,32 +384,77 @@ def _one_inbound(inbounds, instance):
     if instance["profile"] not in ("reality", "hysteria2"):
         raise PanelError("Unsupported profile")
     if len(inbounds) != 1:
-        raise PanelError("Portable schema v1 requires exactly one inbound")
+        raise PanelError("Portable configuration requires exactly one inbound")
     inbound = inbounds[0]
     protocol = "vless" if instance["profile"] == "reality" else "hysteria"
-    if (inbound.get("protocol") != protocol or inbound.get("port") != 443
+    expected_port = 10443 if _local_site(instance) else 443
+    listeners = ("127.0.0.1",) if _local_site(instance) else ("", "0.0.0.0", "::")
+    if (inbound.get("protocol") != protocol or inbound.get("port") != expected_port
             or inbound.get("nodeId") not in (None, 0)
-            or inbound.get("listen", "") not in ("", "0.0.0.0", "::")
+            or inbound.get("listen", "") not in listeners
             or inbound.get("enable") is not True
             or inbound.get("excludeFromSub", False)
             or inbound.get("total", 0) or inbound.get("expiryTime", 0)
             or inbound.get("disableFlow", False)):
-        raise PanelError("Inbound changes cannot be represented by portable schema v1")
+        raise PanelError("Inbound changes cannot be represented by the portable configuration")
     stream = _json_object(inbound.get("streamSettings"), "streamSettings")
     settings = _json_object(inbound.get("settings"), "settings")
+    if instance.get("monitoring") is not None:
+        sniffing = _json_object(inbound.get("sniffing"), "sniffing")
+        if sniffing.get("enabled") is not False:
+            raise PanelError("Managed monitoring requires sniffing to remain disabled")
     if stream.get("finalmask") or settings.get("fallbacks") or inbound.get("fallbackParent"):
-        raise PanelError("Extra transport features cannot be represented by schema v1")
+        raise PanelError("Extra transport features cannot be represented by the portable configuration")
     if instance["profile"] == "reality":
         if (stream.get("network") not in ("tcp", "raw")
                 or stream.get("security") != "reality"
                 or settings.get("decryption", "none") != "none"):
             raise PanelError("Expected VLESS with TCP REALITY")
+        if _local_site(instance):
+            reality = _json_object(stream.get("realitySettings"), "realitySettings")
+            if (stream.get("sockopt") != {"acceptProxyProtocol": True}
+                    or stream.get("externalProxy") != _external_proxy(instance)
+                    or reality.get("target") != LOCAL_REALITY_TARGET
+                    or reality.get("serverNames") != [vpn_domain(instance)]
+                    or reality.get("xver", 0) != 0):
+                raise PanelError("Local REALITY site or public endpoint settings changed")
     else:
         hysteria = _json_object(stream.get("hysteriaSettings"), "hysteriaSettings")
         if (stream.get("network") != "hysteria" or stream.get("security") != "tls"
                 or settings.get("version") != 2 or hysteria.get("version") != 2):
             raise PanelError("Expected Hysteria version 2 with TLS")
     return inbound, settings, stream
+
+
+def _validate_hosts(client, instance, inbound):
+    """Check normalized hosts: they supersede streamSettings.externalProxy."""
+    if instance["schema_version"] == 1:
+        return  # Keep the legacy API contract and direct-listener layout intact.
+    hosts = client.list_hosts()
+    if not _local_site(instance):
+        if hosts:
+            raise PanelError("Custom advertised hosts are outside the portable configuration")
+        return
+    if len(hosts) != 1:
+        raise PanelError("Local REALITY requires exactly one managed advertised host")
+    host = hosts[0]
+    if (host.get("inboundId") != inbound["id"] or host.get("address") != vpn_domain(instance)
+            or host.get("port") != 443 or host.get("security") != "same"
+            or host.get("remark") != "vpn-installer-reality"
+            or host.get("isDisabled", False) or host.get("isHidden", False)
+            or host.get("randomCount", 1) != 1):
+        raise PanelError("Managed advertised host changed; public VPN endpoint must remain on port 443")
+    # These optional overrides would change the generated client config but
+    # cannot be represented by schema 2. Ignore only row identity/timestamps.
+    unsupported = (
+        "serverDescription", "tags", "sni", "snis", "sniSharedRandom", "hostHeader", "path",
+        "alpn", "fingerprint", "cipherSuites", "overrideSniFromAddress", "keepSniBlank",
+        "pinnedPeerCertSha256", "verifyPeerCertByName", "allowInsecure", "echConfigList",
+        "muxParams", "sockoptParams", "finalMask", "vlessRoute", "excludeFromSubTypes",
+        "mihomoIpVersion", "mihomoX25519", "shuffleHost", "nodeGuids",
+    )
+    if any(host.get(field) for field in unsupported):
+        raise PanelError("Managed host overrides cannot be represented by the portable configuration")
 
 
 def configure_instance(client, instance):
@@ -283,17 +464,24 @@ def configure_instance(client, instance):
     if existing:
         inbound, _, stream = _one_inbound(existing, instance)
         expected_stream = json.loads(expected["streamSettings"])
-        if stream != expected_stream or inbound.get("shareAddr") != instance["domain"]:
+        if stream != expected_stream or inbound.get("shareAddr") != vpn_domain(instance):
             raise PanelError("Existing inbound differs; export its current configuration first")
+        _validate_hosts(client, instance, inbound)
         desired = instance_settings(instance)
         live = client.get_settings()
         if any(live.get(key) != value for key, value in desired.items()):
             raise PanelError("Existing panel settings differ; export before reinstalling")
+        validate_monitoring(client, instance)
         return inbound
     if client.list_clients():
         raise PanelError("Refusing to initialize a panel containing unattached users")
+    if instance["schema_version"] == 2 and client.list_hosts():
+        raise PanelError("Refusing to initialize a panel containing unattached advertised hosts")
     client.save_settings(instance_settings(instance))
-    return client.add_inbound(expected)
+    apply_monitoring(client, instance)
+    inbound = client.add_inbound(expected)
+    _validate_hosts(client, instance, inbound)
+    return inbound
 
 
 def export_instance(client, baseline):
@@ -312,6 +500,10 @@ def export_instance(client, baseline):
     if any(live.get(field) != expected[field] for field in layout_fields):
         raise PanelError("Panel listener or public URL layout changed; restore the managed settings before export")
     inbound, _, stream = _one_inbound(client.list_inbounds(), baseline)
+    _validate_hosts(client, baseline, inbound)
+    monitoring = validate_monitoring(client, baseline)
+    if monitoring is not None:
+        result["monitoring"] = monitoring
     path = _nonempty_string(live.get("subPath"), "subPath")
     raw_uri = _nonempty_string(live.get("subURI"), "subURI")
     uri = urllib.parse.urlsplit(raw_uri)
@@ -320,29 +512,23 @@ def export_instance(client, baseline):
     except ValueError:
         raise PanelError("Invalid public subscription URL") from None
     if (uri.scheme != "https" or not uri.hostname or uri.username or uri.password
-            or uri.query or uri.fragment or port != 8443 or uri.path != path
+            or uri.query or uri.fragment or port != (8443 if baseline["schema_version"] == 1 else None)
+            or uri.path != path
             or not path.startswith("/") or not path.endswith("/")):
-        raise PanelError("Subscription URL is outside the schema v1 deployment layout")
+        raise PanelError("Subscription URL is outside the portable deployment layout")
     if (live.get("subEnable") is not True or live.get("subEncrypt") is not True
             or live.get("subJsonAutoDetect", False) or live.get("subClashAutoDetect", False)):
         raise PanelError("Expected an enabled Base64 subscription without format autodetection")
-    # urlsplit.hostname lowercases DNS names. Preserve the configured spelling
-    # so exporting/restoring never changes even the textual subscription URL.
-    domain = uri.netloc.rsplit(":", 1)[0]
-    if raw_uri != "https://%s:8443%s" % (domain, path):
+    if raw_uri != public_origin(baseline) + path:
         raise PanelError("Subscription URL is not in its portable canonical form")
-    result["domain"] = domain
-    result["https_port"] = port
-    result["subscription"]["path"] = path
-    result["panel"]["path"] = _nonempty_string(live.get("webBasePath"), "webBasePath")
     if (inbound.get("shareAddrStrategy") != "custom"
-            or inbound.get("shareAddr") != result["domain"]):
+            or inbound.get("shareAddr") != vpn_domain(result)):
         raise PanelError("VPN address differs from the portable public domain")
     if baseline["profile"] == "reality":
         reality = _json_object(stream.get("realitySettings"), "realitySettings")
         names, ids = reality.get("serverNames"), reality.get("shortIds")
         if not isinstance(names, list) or len(names) != 1 or not isinstance(ids, list) or len(ids) != 1:
-            raise PanelError("Schema v1 supports one REALITY server name and short ID")
+            raise PanelError("Portable configuration supports one REALITY server name and short ID")
         client_settings = _json_object(reality.get("settings"), "realitySettings.settings")
         result["reality"] = {
             "target": _nonempty_string(reality.get("target") or reality.get("dest"), "target"),
@@ -360,7 +546,7 @@ def export_instance(client, baseline):
                 or not isinstance(certs[0], dict)
                 or certs[0].get("certificateFile") != cert_dir + "/fullchain.pem"
                 or certs[0].get("keyFile") != cert_dir + "/privkey.pem"):
-            raise PanelError("TLS changes cannot be represented by portable schema v1")
+            raise PanelError("TLS changes cannot be represented by the portable configuration")
     users = []
     for row in client.list_clients():
         attached = row.get("inboundIds") or []
@@ -379,7 +565,7 @@ def export_instance(client, baseline):
                 or any(row.get(key, 0) for key in ("reset", "resetDay", "resetWeekday", "resetMax"))
                 or row.get("trafficReset", "never") not in ("", "never")
                 or (baseline["profile"] == "reality" and row.get("flow") != "xtls-rprx-vision")):
-            raise PanelError("User settings cannot be represented by portable schema v1")
+            raise PanelError("User settings cannot be represented by the portable configuration")
         user = {
             "email": _nonempty_string(row.get("email"), "email"),
             "sub_id": _nonempty_string(row.get("subId"), "sub_id"),

@@ -19,6 +19,6 @@ exec docker run --rm --init --platform linux/amd64 \
     ubuntu:24.04 bash -euc '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -yqq --no-install-recommends python3 openssl nginx ca-certificates >/dev/null
+        apt-get install -yqq --no-install-recommends python3 openssl nginx libnginx-mod-stream ca-certificates >/dev/null
         exec python3 -u tests/integration.py "$@"
     ' integration "${test_args[@]}"

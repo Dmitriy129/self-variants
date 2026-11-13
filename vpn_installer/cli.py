@@ -2,22 +2,28 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import closing
+from copy import deepcopy
 import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
 import urllib.error
 
-from .config import (ConfigError, load_instance, new_instance, panel_url,
-                     save_instance, subscription_urls)
-from . import network, system
-from .panel import PanelClient, configure_instance, export_instance
+from .config import (ConfigError, load_instance, load_user_names, new_instance, panel_url, parse_user_names,
+                     save_instance, subscription_urls, SITE_TEMPLATES)
+from . import monitoring, network, system
+from .panel import (PanelClient, apply_monitoring, configure_instance, export_instance,
+                    validate_monitoring)
 
 STATE_DIR = system.STATE_DIR
+DEFAULT_USERS_FILE = Path(__file__).resolve().parents[1] / 'users.json'
+EXAMPLE_USERS_FILE = Path(__file__).resolve().parents[1] / 'users.example.json'
 
 
 def parser():
@@ -30,9 +36,23 @@ def parser():
     mode.add_argument('--backup', action='store_true', help='сохранить БД, настройки и переносимый JSON')
     mode.add_argument('--status', action='store_true', help='проверить сервисы и доступ к панели')
     mode.add_argument('--update', action='store_true', help='явно установить версии из versions.json после backup')
-    p.add_argument('--domain', help='DNS-имя VPS (первая установка)')
+    mode.add_argument('--set-monitoring', choices=('basic', 'destinations'),
+                      help='сменить режим мониторинга установленного сервера без изменения пользователей')
+    mode.add_argument('--show-logs', action='store_true', help='показать последние записи архива подключений')
+    p.add_argument('--domain', help='домен панели и подписок (первая установка)')
     p.add_argument('--email', help='email для Let’s Encrypt (первая установка)')
-    p.add_argument('--reality-target', help='TLS-сайт REALITY в формате hostname:443')
+    p.add_argument('--site-domain', help='отдельный домен сайта и REALITY на том же VPS')
+    p.add_argument('--site-template', choices=('random', *SITE_TEMPLATES),
+                   help='шаблон сайта; по умолчанию random, результат сохраняется в instance.json')
+    users = p.add_mutually_exclusive_group()
+    users.add_argument('--users-file', type=Path,
+                       help='JSON со стартовым списком пользователей; по умолчанию users.json или users.example.json')
+    users.add_argument('--users', help='имена стартовых пользователей через запятую; например owner,family-1,family-2')
+    p.add_argument('--monitoring', choices=('basic', 'destinations'),
+                   help='первая установка: basic по умолчанию; destinations добавляет журнал назначений')
+    p.add_argument('--log-user', help='имя клиента для --show-logs')
+    p.add_argument('--log-lines', type=int, default=100, help='число последних записей --show-logs (1–10000)')
+    p.add_argument('--reality-target', help=argparse.SUPPRESS)
     p.add_argument('--prepare', action='store_true', help='подготовить новый VPS до переключения DNS; без выпуска TLS')
     return p
 
@@ -74,8 +94,8 @@ def write_state(state, directory=STATE_DIR):
 
 
 def namespace(instance):
-    return (instance['profile'], instance['domain'], instance['https_port'],
-            instance['panel']['path'], instance['subscription']['path'])
+    return (instance['schema_version'], instance['profile'], instance['domain'], instance['https_port'],
+            instance['panel']['path'], instance['subscription']['path'], instance.get('site', {}).get('domain'))
 
 
 def connected_panel(instance, attempts=1):
@@ -101,11 +121,31 @@ def export_live(instance, destination):
 
 
 def show_result(instance, show_password=False):
+    project_dir = Path(__file__).resolve().parents[1]
     lines = [f'Панель: {panel_url(instance)}', f'Администратор: {instance["panel"]["username"]}']
+    if instance.get('site'):
+        lines.append(f'Сайт: https://{instance["site"]["domain"]}/ (шаблон {instance["site"]["template"]})')
+    if instance.get('monitoring'):
+        settings = instance['monitoring']
+        lines.append(f'Мониторинг: {settings["mode"]}. Трафик и недавние IP — в карточке клиента.')
+        if settings['mode'] == 'destinations':
+            lines.append('Свежие назначения — в Xray Log панели; поиск по имени клиента, домену или IP.')
+        lines.append(f'Архив: до {settings["retention_days"]} дней, бюджет {settings["max_log_mb"]} MiB; '
+                     'при достижении лимита старые записи удаляются раньше.')
+        lines.append(f'Просмотр архива: sudo bash {shlex.quote(str(project_dir / "install.sh"))} --show-logs --log-user ИМЯ')
     if show_password:
         lines.append(f'Пароль: {instance["panel"]["password"]}')
     lines.extend(f'Подписка {email}: {url}' for email, url in subscription_urls(instance).items())
     lines.append(f'Переносимый файл: {STATE_DIR / "instance.json"}. Сохраните копию вне VPS.')
+    lines.extend([
+        '', 'Что дальше:',
+        '1. Откройте адрес «Панель» целиком, включая путь, и войдите под указанным администратором.',
+        '2. В v2rayNG добавьте группу подписки с URL из строки «Подписка», обновите её и выберите профиль.',
+        '3. Для subs-resolver используйте тот же URL подписки как HTTP-источник.',
+        '4. Сохраните instance.json вне VPS; после изменения пользователей экспортируйте его заново:',
+        f'   sudo bash {shlex.quote(str(project_dir / "install.sh"))} --export-config /root/instance.json',
+        f'Инструкция: {project_dir / "README.md"}. Данные администратора хранятся в instance.json.',
+    ])
     print('\n'.join(lines))
 
 
@@ -117,6 +157,10 @@ def verify_services(instance):
     client = connected_panel(instance)
     for _ in range(20):
         if client.xray_running():
+            if instance.get('site'):
+                system.check_reality_target(instance)
+            if instance.get('monitoring'):
+                validate_monitoring(client, instance)
             return
         time.sleep(0.5)
     raise system.InstallError('Панель работает, но Xray не подтвердил успешный запуск конфигурации.')
@@ -133,7 +177,54 @@ def maintain(args, state):
     if not state or state.get('phase') != 'complete':
         raise system.InstallError('Сначала завершите установку.')
     instance = load_instance(STATE_DIR / 'instance.json')
-    if args.export_config:
+    if args.show_logs:
+        if 'monitoring' not in instance:
+            raise system.InstallError('В этой старой конфигурации архив мониторинга не настроен.')
+        lines = deque(monitoring.history_lines(instance['monitoring'], user=args.log_user), maxlen=args.log_lines)
+        if not lines:
+            print('Подходящих записей в архиве пока нет. Сбор выполняется раз в минуту.')
+        for line in lines:
+            # Logs may contain untrusted destination text; do not emit terminal controls.
+            print(''.join(char for char in line.rstrip('\r\n') if char.isprintable() or char == '\t'))
+    elif args.set_monitoring:
+        if 'monitoring' not in instance:
+            raise system.InstallError('Эта старая установка не управляет мониторингом через переносимый файл. '
+                                      'Автоматическая смена её настроек журналов не выполняется.')
+        live = export_and_backup(instance)
+        target = deepcopy(live)
+        target['monitoring']['mode'] = args.set_monitoring
+        client = connected_panel(live)
+        previous_template = client.get_xray_settings()
+        try:
+            monitoring.configure(target, runner=system.run)
+            apply_monitoring(client, target)
+            system.run(['systemctl', 'restart', 'x-ui'])
+            connected_panel(target, attempts=40)
+            verify_services(target)
+            save_instance(STATE_DIR / 'instance.json', target)
+        except Exception:
+            failed = False
+            try:
+                connected_panel(live, attempts=40).save_xray_settings(previous_template)
+                system.run(['systemctl', 'restart', 'x-ui'])
+            except Exception:
+                failed = True
+            try:
+                monitoring.configure(live, runner=system.run)
+            except Exception:
+                failed = True
+            if not failed:
+                try:
+                    connected_panel(live, attempts=40)
+                    verify_services(live)
+                except Exception:
+                    failed = True
+            if failed:
+                raise system.InstallError('Смена мониторинга не завершилась, полный откат не подтверждён. '
+                                          f'Резервная копия находится в {STATE_DIR / "backups"}.') from None
+            raise
+        print(f'Режим мониторинга: {args.set_monitoring}. Пользователи и ссылки сохранены.')
+    elif args.export_config:
         live = export_live(instance, args.export_config)
         if args.export_config.resolve() != (STATE_DIR / 'instance.json').resolve():
             save_instance(STATE_DIR / 'instance.json', live)
@@ -212,6 +303,8 @@ def deploy(args, supplied=None):
     managed = state is not None
     if managed:
         instance = load_instance(STATE_DIR / 'instance.json')
+        if args.monitoring and args.monitoring != instance.get('monitoring', {}).get('mode'):
+            raise system.InstallError('Для смены мониторинга готовой установки используйте --set-monitoring.')
         if supplied and namespace(supplied) != namespace(instance):
             raise system.InstallError('Домен, пути или пресет отличаются от этой установки. Используйте чистый VPS.')
         if args.profile and args.profile != instance['profile']:
@@ -226,16 +319,36 @@ def deploy(args, supplied=None):
     elif supplied:
         instance = supplied
     else:
-        domain = ask(args.domain, 'Домен сервера (--domain)')
+        domain = ask(args.domain, 'Домен панели и подписок (--domain)')
         email = ask(args.email, 'Email для сертификата (--email)')
-        target = ask(args.reality_target, 'TLS-сайт REALITY (--reality-target)', 'www.microsoft.com:443') if args.profile == 'reality' else None
-        instance = new_instance(args.profile, domain, email, reality_target=target)
+        if args.reality_target:
+            raise system.InstallError('Новые установки REALITY используют собственный сайт. '
+                                      'Укажите --site-domain; старые настройки доступны через --config.')
+        site_domain, site_template = None, None
+        if args.profile == 'reality':
+            site_domain = ask(getattr(args, 'site_domain', None), 'Домен сайта и REALITY (--site-domain)')
+            site_template = getattr(args, 'site_template', None) or 'random'
+        elif getattr(args, 'site_domain', None) or getattr(args, 'site_template', None):
+            raise system.InstallError('--site-domain и --site-template используются с REALITY.')
+        if args.users is not None:
+            user_names = parse_user_names(args.users)
+        else:
+            default_users = DEFAULT_USERS_FILE if DEFAULT_USERS_FILE.exists() else EXAMPLE_USERS_FILE
+            user_names = load_user_names(args.users_file or default_users)
+        instance = new_instance(args.profile, domain, email, site_domain=site_domain,
+                                site_template=site_template, user_names=user_names,
+                                monitoring_mode=args.monitoring or 'basic')
 
     if not managed:
         system.check_clean_host(instance)
     if not args.prepare:
         system.check_dns(instance['domain'])
-    system.check_reality_target(instance)
+        if instance.get('site'):
+            system.check_dns(instance['site']['domain'])
+    # Legacy targets exist independently. A new local target can only be
+    # checked after its certificate and HTTPS listener have been installed.
+    if not instance.get('site'):
+        system.check_reality_target(instance)
     ssh_ports = system.detect_ssh_ports()
     if managed:
         ssh_ports = sorted(set(ssh_ports) | set(state.get('ssh_ports', [])))
@@ -256,6 +369,8 @@ def deploy(args, supplied=None):
         system.run(['systemctl', 'stop', 'x-ui'], check=False)
     system.install_binaries(artifacts)
     system.bootstrap_panel(instance)
+    if instance.get('monitoring'):
+        monitoring.configure(instance, runner=system.run)
     default_site = Path('/etc/nginx/sites-enabled/default')
     if default_site.is_symlink():
         default_site.unlink()
@@ -269,12 +384,16 @@ def deploy(args, supplied=None):
 
     print('Выпускаю сертификат и настраиваю выбранный VPN…', flush=True)
     network.issue_certificate(instance, runner=system.run)
+    if instance.get('site'):
+        network.install_static_site(instance)
+    network.configure_https(instance, runner=system.run)
+    if instance.get('site'):
+        system.check_reality_target(instance)
     system.run(['systemctl', 'enable', '--now', 'x-ui'])
     client = connected_panel(instance, attempts=40)
     configure_instance(client, instance)
     system.run(['systemctl', 'restart', 'x-ui'])
     connected_panel(instance, attempts=40)
-    network.configure_https(instance, runner=system.run)
     verify_services(instance)
     instance = export_live(instance, STATE_DIR / 'instance.json')
     state['phase'] = 'complete'
@@ -296,6 +415,11 @@ def main(argv=None):
             return 0
         if args.prepare and not (args.profile or args.config):
             raise system.InstallError('--prepare применяется только к установке.')
+        if args.monitoring and not args.profile:
+            raise system.InstallError('--monitoring применяется к первой установке через --profile; '
+                                      'для смены режима используйте --set-monitoring.')
+        if not 1 <= args.log_lines <= 10000 or (args.log_user and not args.show_logs):
+            raise system.InstallError('--log-lines: от 1 до 10000; --log-user используется с --show-logs.')
         system.require_host()
         with open('/run/lock/vpn-installer.lock', 'a') as lock:
             try:

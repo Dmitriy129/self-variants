@@ -15,3 +15,10 @@ dist/
 *.key
 .env
 .env.*
+.DS_Store
+.serena/
+.agents/
+.codex/
+users.json
+users.local.json
+x-ui-pro-review/
