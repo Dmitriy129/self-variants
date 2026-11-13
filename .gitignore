@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+instance.json
+instance-*.json
+*.secret.json
+backups/
+artifacts/
+dist/
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+.env
+.env.*

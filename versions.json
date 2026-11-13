@@ -1,0 +1,12 @@
+{
+  "3x-ui": {
+    "version": "3.11.0",
+    "url": "https://github.com/MHSanaei/3x-ui/releases/download/v3.11.0/x-ui-linux-amd64.tar.gz",
+    "sha256": "0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916"
+  },
+  "xray": {
+    "version": "26.11.9",
+    "url": "https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip",
+    "sha256": "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82"
+  }
+}
