@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/Dmitriy129/self-variants/main/boots
 
 Префикс подписок — общая секретная часть ссылок: **кто знает этот префикс, может перебирать имена пользователей и получать их VPN-профили**. Имена в URL не скрываются. Не публикуйте рабочий префикс или готовую команду. Режим `names` включается явно; по умолчанию `--subscription-ids random`, путь подписок `/sub/`, а путь панели случайный. Такие случайные ссылки сохраняются при переносе через `instance.json`.
 
-Предварительно загружать архив не нужно. `bootstrap.sh` скачивает пакет релиза **v0.1.1**, проверяет его SHA-256 по встроенному значению, сохраняет установщик в `/opt/vpn-installer/releases/v0.1.1` и передаёт указанные аргументы в `install.sh`. Постоянный путь для обслуживания — **`/opt/vpn-installer/current/install.sh`**. Эта команда включает журнал назначений; для базовых показателей без такого журнала используйте `--monitoring basic`.
+Предварительно загружать архив не нужно. `bootstrap.sh` скачивает пакет релиза **v0.1.2**, проверяет его SHA-256 по встроенному значению, сохраняет установщик в `/opt/vpn-installer/releases/v0.1.2` и передаёт указанные аргументы в `install.sh`. Постоянный путь для обслуживания — **`/opt/vpn-installer/current/install.sh`**. Эта команда включает журнал назначений; для базовых показателей без такого журнала используйте `--monitoring basic`.
 
 | Пресет | VPN | Клиент |
 |---|---|---|
@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/Dmitriy129/self-variants/main/boots
 
 ### Альтернатива: архив или исходники
 
-Можно вручную загрузить архив из [релиза v0.1.1](https://github.com/Dmitriy129/self-variants/releases/tag/v0.1.1) или скопировать исходники проекта на VPS. Распакуйте архив и перейдите в папку с `install.sh`, `versions.json`, стартовым списком `users.json` или `users.example.json`, `vpn_installer/` и `sites/`:
+Можно вручную загрузить архив из [релиза v0.1.2](https://github.com/Dmitriy129/self-variants/releases/tag/v0.1.2) или скопировать исходники проекта на VPS. Распакуйте архив и перейдите в папку с `install.sh`, `versions.json`, стартовым списком `users.json` или `users.example.json`, `vpn_installer/` и `sites/`:
 
 ```bash
 sudo bash install.sh --profile reality \

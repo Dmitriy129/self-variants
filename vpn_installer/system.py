@@ -121,8 +121,32 @@ def check_dns(domain, runner=run):
         addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(domain, 443)}
     except socket.gaierror as exc:
         raise InstallError('Домен не разрешается. Настройте A/AAAA или используйте --prepare.') from exc
-    interfaces = json.loads(runner(['ip', '-j', 'address', 'show', 'scope', 'global']).stdout)
-    local = {ipaddress.ip_address(a['local']) for iface in interfaces for a in iface.get('addr_info', [])}
+    output = runner(['ip', '-j', 'address', 'show', 'scope', 'global']).stdout
+    try:
+        interfaces = json.loads(output)
+        if not isinstance(interfaces, list):
+            raise ValueError('expected an interface array')
+        local = set()
+        for iface in interfaces:
+            if not isinstance(iface, dict):
+                raise ValueError('expected an interface object')
+            entries = iface.get('addr_info', [])
+            if not isinstance(entries, list):
+                raise ValueError('expected an address array')
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError('expected an address object')
+                # iproute2 opens a JSON object before applying its scope filter,
+                # so filtered addresses can appear as {}. Only local is assigned
+                # to this host; address/peer may describe a remote tunnel endpoint.
+                if 'local' not in entry:
+                    continue
+                if not isinstance(entry['local'], str):
+                    raise ValueError('expected an IP address string')
+                local.add(ipaddress.ip_address(entry['local']))
+    except (ValueError, TypeError):
+        raise InstallError('Не удалось прочитать IP-адреса интерфейсов. '
+                           'Проверьте вывод: ip -j address show scope global.') from None
     if not addresses or not addresses.issubset(local):
         raise InstallError('Все A/AAAA домена должны указывать на публичные адреса этого VPS. '
                            'Для установки до смены DNS используйте --prepare. NAT/CDN не поддерживаются.')

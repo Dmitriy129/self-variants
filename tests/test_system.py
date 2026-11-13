@@ -215,6 +215,77 @@ class HostChecks(unittest.TestCase):
         self.assertEqual(runner.call_args.kwargs["env"]["DEBIAN_FRONTEND"], "noninteractive")
 
 
+class DNSChecks(unittest.TestCase):
+    def setUp(self):
+        # Documentation addresses stand in for the VPS's global-scope IPv4/IPv6.
+        self.answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('203.0.113.10', 443)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::10', 443, 0, 0)),
+        ]
+        self.interfaces = [{
+            'ifindex': 2, 'ifname': 'ens192', 'flags': ['BROADCAST', 'MULTICAST', 'UP', 'LOWER_UP'],
+            'addr_info': [
+                {'family': 'inet', 'local': '203.0.113.10', 'prefixlen': 24, 'scope': 'global'},
+                {'family': 'inet6', 'local': '2001:db8::10', 'prefixlen': 64, 'scope': 'global'},
+                {},
+            ],
+        }]
+
+    def check(self, report, answers=None):
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout=report))
+        with mock.patch.object(system.socket, 'getaddrinfo', return_value=self.answers if answers is None else answers):
+            system.check_dns('vpn.example.com', runner)
+        return runner
+
+    def test_matching_ipv4_and_ipv6_accept_legitimate_trailing_empty_address_object(self):
+        runner = self.check(json.dumps(self.interfaces))
+        runner.assert_called_once_with(['ip', '-j', 'address', 'show', 'scope', 'global'])
+
+    def test_empty_address_objects_never_satisfy_dns_ownership(self):
+        for interfaces in ([], [{}], [{'addr_info': []}], [{'addr_info': [{}]}],
+                           [{'addr_info': [{}, {}]}, {'addr_info': []}]):
+            with self.subTest(interfaces=interfaces), self.assertRaises(system.InstallError):
+                self.check(json.dumps(interfaces))
+
+    def test_foreign_a_or_aaaa_still_refused_when_empty_object_is_skipped(self):
+        foreign = (
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('203.0.113.99', 443)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::99', 443, 0, 0)),
+        )
+        for answer in foreign:
+            with self.subTest(family=answer[0]), self.assertRaises(system.InstallError):
+                self.check(json.dumps(self.interfaces), self.answers + [answer])
+
+    def test_peer_address_is_never_used_as_a_local_address_fallback(self):
+        for record in ({'family': 'inet', 'peer': '203.0.113.10'},
+                       {'family': 'inet', 'local': '203.0.113.99', 'peer': '203.0.113.10'}):
+            with self.subTest(record=record), self.assertRaises(system.InstallError):
+                self.check(json.dumps([{'addr_info': [record, {}]}]), self.answers[:1])
+
+    def test_malformed_json_and_container_types_raise_install_error(self):
+        reports = ['not-json', '{"broken":']
+        malformed = (None, {}, {'addr_info': []}, 'interfaces', [None], [42], [[]],
+                     [{'addr_info': None}], [{'addr_info': {}}], [{'addr_info': 'addresses'}],
+                     [{'addr_info': [None]}], [{'addr_info': [42]}], [{'addr_info': [[]]}],
+                     [{'addr_info': ['203.0.113.10']}])
+        reports.extend(json.dumps(value) for value in malformed)
+        for report in reports:
+            with self.subTest(report=report), self.assertRaises(system.InstallError):
+                self.check(report)
+
+    def test_present_but_invalid_local_field_is_not_silently_skipped_or_coerced(self):
+        for local in (None, '', 'not-an-ip', '203.0.113.10/24', '2001:db8::10/64',
+                      0, 3405803786, True, [], {}):
+            interfaces = json.loads(json.dumps(self.interfaces))
+            interfaces[0]['addr_info'].append({'local': local})
+            with self.subTest(local=local), self.assertRaises(system.InstallError):
+                self.check(json.dumps(interfaces))
+
+    def test_empty_dns_answer_is_not_accepted_even_with_real_interface_addresses(self):
+        with self.assertRaises(system.InstallError):
+            self.check(json.dumps(self.interfaces), [])
+
+
 class ArtifactTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
