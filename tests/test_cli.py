@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from vpn_installer import cli, system
-from vpn_installer.config import ConfigError, save_instance
+from vpn_installer.config import ConfigError, load_instance, save_instance, subscription_urls
 
 
 def manifest(profile="hysteria2", version=1):
@@ -51,6 +51,23 @@ def monitored_manifest(mode="basic", profile="hysteria2", version=2):
 
 
 class MainBoundaryTests(unittest.TestCase):
+    def test_live_export_saves_names_marker_and_preserves_renamed_user_url(self):
+        baseline = manifest("hysteria2", 2)
+        baseline["subscription"] = {"path": "/app/", "id_mode": "names"}
+        baseline["users"][0].update(email="fix", sub_id="fix")
+        live = copy.deepcopy(baseline)
+        live["users"][0].update(email="renamed-user", enable=False)
+        client = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "export.json"
+            with mock.patch.object(cli, "connected_panel", return_value=client), \
+                    mock.patch.object(cli, "export_instance", return_value=live) as export:
+                self.assertEqual(cli.export_live(baseline, path), live)
+            export.assert_called_once_with(client, baseline)
+            restored = load_instance(path)
+            self.assertEqual(restored, live)
+            self.assertEqual(subscription_urls(restored), {"renamed-user": "https://vpn.example.com/app/fix"})
+
     def test_cli_names_and_users_file_are_mutually_exclusive(self):
         for options in (["--users", "owner,family", "--users-file", "/unused.json"],
                         ["--users-file", "/unused.json", "--users", "owner,family"]):
@@ -274,6 +291,45 @@ class DeploySequenceTests(unittest.TestCase):
             "--profile", "hysteria2", "--domain", "vpn.example.com",
             "--email", "owner@example.com", *options])
 
+    def test_fresh_names_and_public_path_flags_reach_generator(self):
+        with mock.patch.object(cli, "new_instance", wraps=cli.new_instance) as create:
+            cli.deploy(self.new_args("--users", "fix,ee,fix-vps", "--subscription-ids", "names",
+                                     "--subscription-path", "app", "--panel-path", "control"))
+        self.assertEqual(create.call_args.kwargs["subscription_ids"], "names")
+        self.assertEqual(create.call_args.kwargs["subscription_path"], "app")
+        self.assertEqual(create.call_args.kwargs["panel_path"], "control")
+        saved = self.mocks["save_instance"].call_args.args[1]
+        self.assertEqual(saved["subscription"], {"path": "/app/", "id_mode": "names"})
+        self.assertEqual(saved["panel"]["path"], "/control/")
+        self.assertEqual([user["sub_id"] for user in saved["users"]], ["fix", "ee", "fix-vps"])
+
+    def test_same_named_subscription_command_on_two_clean_states_recreates_urls(self):
+        args = self.new_args("--users", "fix,ee,fix-vps", "--subscription-ids", "names",
+                             "--subscription-path", "app", "--panel-path", "control")
+        instances = []
+        for number in (1, 2):
+            with mock.patch.object(cli, "STATE_DIR", self.root / f"clean-state-{number}"):
+                cli.deploy(args)
+            instances.append(copy.deepcopy(self.mocks["save_instance"].call_args.args[1]))
+        expected = {name: f"https://vpn.example.com/app/{name}" for name in ("fix", "ee", "fix-vps")}
+        self.assertEqual(subscription_urls(instances[0]), expected)
+        self.assertEqual(subscription_urls(instances[1]), expected)
+        for before, after in zip(instances[0]["users"], instances[1]["users"]):
+            self.assertNotEqual(before["password"], after["password"])
+
+    def test_invalid_named_subscription_input_refuses_fresh_install_before_host_actions(self):
+        for options in (("--users", "fix,мама"), ("--users", "fix", "--subscription-path", "bad//path"),
+                        ("--users", "fix", "--subscription-path", "app", "--panel-path", "app/child")):
+            with self.subTest(options=options), \
+                    mock.patch("vpn_installer.config.secrets.token_urlsafe", side_effect=AssertionError("validate before generation")), \
+                    self.assertRaises(ConfigError):
+                cli.deploy(self.new_args("--subscription-ids", "names", *options))
+        for name in ("check_clean_host", "check_dns", "detect_ssh_ports", "download_artifacts",
+                     "write_state", "save_instance", "install_dependencies", "configure_firewall",
+                     "install_binaries", "bootstrap_panel", "configure_http", "run"):
+            self.mocks[name].assert_not_called()
+        self.assertFalse((self.root / "state").exists())
+
     def test_inline_names_bypass_both_files_and_preserve_the_requested_users(self):
         self.startup_users.write_text("invalid local file must not be read")
         self.example_users.unlink()
@@ -387,7 +443,8 @@ class DeploySequenceTests(unittest.TestCase):
         self.mocks["export_live"].side_effect = None
         self.mocks["export_live"].return_value = live
         for options in ((), ("--users-file", str(self.root / "missing.json")),
-                        ("--users", "replacement,REPLACEMENT")):
+                        ("--users", "replacement,REPLACEMENT"),
+                        ("--subscription-ids", "names", "--subscription-path", "changed//invalid", "--panel-path", "new-control")):
             with self.subTest(options=options), \
                     mock.patch.object(cli, "load_user_names", side_effect=AssertionError("must not read startup users")) as load, \
                     mock.patch.object(cli, "parse_user_names", side_effect=AssertionError("must not parse replacement users")) as parse, \
@@ -408,7 +465,8 @@ class DeploySequenceTests(unittest.TestCase):
         self.mocks["load_instance"].return_value = saved
         self.startup_users.write_text(json.dumps(["replacement-family"]))
         for options in ((), ("--users-file", str(self.root / "missing.json")),
-                        ("--users", "replacement,REPLACEMENT")):
+                        ("--users", "replacement,REPLACEMENT"),
+                        ("--subscription-ids", "names", "--subscription-path", "changed//invalid", "--panel-path", "new-control")):
             self.mocks["read_state"].return_value = {"phase": "prepared", "ssh_ports": [2222]}
             with self.subTest(options=options), \
                     mock.patch.object(cli, "load_user_names", side_effect=AssertionError("must not read startup users")) as load, \
@@ -428,7 +486,8 @@ class DeploySequenceTests(unittest.TestCase):
             supplied["users"][0]["enable"] = False
             before = copy.deepcopy(supplied)
             for options in (("--users-file", str(self.root / "missing.json")),
-                            ("--users", "replacement,REPLACEMENT")):
+                            ("--users", "replacement,REPLACEMENT"),
+                            ("--subscription-ids", "names", "--subscription-path", "changed//invalid", "--panel-path", "new-control")):
                 args = cli.parser().parse_args(["--config", "/unused.json", *options])
                 with self.subTest(profile=profile, version=version, options=options), \
                         mock.patch.object(cli, "load_user_names", side_effect=AssertionError("restore must not read startup users")) as load, \

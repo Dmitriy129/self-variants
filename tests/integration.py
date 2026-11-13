@@ -144,8 +144,11 @@ def artifacts_from(directory, work):
 
 
 def test_instance(profile, version):
+    named_options = ({'subscription_ids': 'names', 'user_names': ['fix'],
+                      'subscription_path': 'private-fixture', 'panel_path': 'panel-fixture'}
+                     if version == 2 else {})
     instance = new_instance(profile, DOMAIN, "owner@example.test",
-                            site_domain=TARGET if profile == "reality" else None)
+                            site_domain=TARGET if profile == "reality" else None, **named_options)
     if version == 1:
         instance.update(schema_version=1, https_port=8443)
         instance.pop("site", None)
@@ -157,7 +160,8 @@ def test_instance(profile, version):
     # Test multiple independently portable users and both boolean states.
     for index in (2, 3):
         user = copy.deepcopy(instance["users"][0])
-        user.update(email=f"user{index}@{DOMAIN}", sub_id=secrets.token_urlsafe(18),
+        name = ('ee' if index == 2 else 'fix-vps') if version == 2 else f"user{index}@{DOMAIN}"
+        user.update(email=name, sub_id=name if version == 2 else secrets.token_urlsafe(18),
                     enable=index == 2, total_gb=50 * 1024**3, limit_ip=2,
                     expiry_time=4102444800000 if index == 3 else 0)
         user["uuid" if profile == "reality" else "password"] = str(uuid.uuid4()) if profile == "reality" else secrets.token_urlsafe(24)

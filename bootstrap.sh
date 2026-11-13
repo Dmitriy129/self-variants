@@ -4,8 +4,8 @@ set -euo pipefail
 umask 077
 export PATH="/usr/sbin:${PATH:-/usr/bin:/bin}"
 
-RELEASE_TAG='v0.1.0'
-ARCHIVE_SHA256='d8e59daab8ce6ee14d38e93b4bd43f5ccc8a9c20813687a1f2d20912337e7b26'
+RELEASE_TAG='v0.1.1'
+ARCHIVE_SHA256='f46078877be983085258a757f0547e3983b7d1a207d58f83126ccbbcb14dad84'
 INSTALL_ROOT='/opt/vpn-installer'
 OS_RELEASE='/etc/os-release'
 SYSTEMD_ROOT='/run/systemd/system'

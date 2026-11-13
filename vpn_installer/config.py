@@ -33,6 +33,7 @@ _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_USERS = 10000
 _PATH = re.compile(r"/(?:[A-Za-z0-9_-]+/)+\Z", re.ASCII)
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{8,128}\Z", re.ASCII)
+_NAMED_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z", re.ASCII)
 _USERNAME = re.compile(r"[A-Za-z0-9_.@-]{1,64}\Z", re.ASCII)
 _LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z", re.ASCII)
 _PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
@@ -226,12 +227,20 @@ def validate_instance(data: Any) -> dict:
             raise ConfigError("site.template must name a built-in site template")
 
     panel = _fields(data["panel"], {"path", "username", "password"}, "panel")
-    subscription = _fields(data["subscription"], {"path"}, "subscription")
+    subscription_fields = {"path"}
+    if isinstance(data["subscription"], dict) and "id_mode" in data["subscription"]:
+        subscription_fields.add("id_mode")
+    subscription = _fields(data["subscription"], subscription_fields, "subscription")
+    named_ids = "id_mode" in subscription
+    if named_ids and subscription["id_mode"] != "names":
+        raise ConfigError("subscription.id_mode must be names when present")
     for field, value in (("panel.path", panel["path"]), ("subscription.path", subscription["path"])):
         if not isinstance(value, str) or len(value) > 256 or not _PATH.fullmatch(value):
             raise ConfigError(f"{field} must begin and end with / and contain nonempty ASCII letters, digits, _ or - segments")
     if panel["path"].startswith(subscription["path"]) or subscription["path"].startswith(panel["path"]):
         raise ConfigError("panel.path and subscription.path must not overlap")
+    if subscription['path'].startswith('/assets/'):
+        raise ConfigError('subscription.path conflicts with the upstream assets route')
     if not isinstance(panel["username"], str) or not _USERNAME.fullmatch(panel["username"]):
         raise ConfigError("panel.username must contain 1 to 64 ASCII letters, digits, _, ., @ or -")
     _password(panel["password"], "panel.password")
@@ -247,8 +256,10 @@ def validate_instance(data: Any) -> dict:
         field = f"users[{index}]"
         _fields(user, {"email", "sub_id", "enable", "expiry_time", "total_gb", "limit_ip", credential}, field)
         _user_name(user["email"], f"{field}.email")
-        if not isinstance(user["sub_id"], str) or not _TOKEN.fullmatch(user["sub_id"]):
-            raise ConfigError(f"{field}.sub_id must contain 8 to 128 ASCII letters, digits, _ or -")
+        id_pattern = _NAMED_ID if named_ids else _TOKEN
+        if not isinstance(user["sub_id"], str) or not id_pattern.fullmatch(user["sub_id"]):
+            minimum = 1 if named_ids else 8
+            raise ConfigError(f"{field}.sub_id must contain {minimum} to 128 ASCII letters, digits, _ or -")
         if type(user["enable"]) is not bool:
             raise ConfigError(f"{field}.enable must be a boolean")
         for name in ("expiry_time", "total_gb", "limit_ip"):
@@ -286,10 +297,22 @@ def validate_instance(data: Any) -> dict:
     return copy.deepcopy(data)
 
 
+def normalize_path(value: str, field: str) -> str:
+    """Accept a CLI path with optional edge slashes; never repair unsafe paths."""
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f'{field} must be a nonempty path')
+    path = value if value.startswith('/') else '/' + value
+    path = path if path.endswith('/') else path + '/'
+    if len(path) > 256 or not _PATH.fullmatch(path):
+        raise ConfigError(f'{field} must contain nonempty ASCII letters, digits, _ or - path segments')
+    return path
+
+
 def new_instance(profile: str, domain: str, email: str, reality_target: str | None = None,
                  admin_password: str | None = None, *, site_domain: str | None = None,
                  site_template: str | None = None, user_names: list[str] | None = None,
-                 monitoring_mode: str = "basic") -> dict:
+                 monitoring_mode: str = "basic", subscription_ids: str = "random",
+                 subscription_path: str = "/sub/", panel_path: str | None = None) -> dict:
     """Create a schema 2 deployment. Existing schema 1 files are restore-only."""
     if profile not in ("reality", "hysteria2"):
         raise ConfigError("profile must be reality or hysteria2")
@@ -308,19 +331,33 @@ def new_instance(profile: str, domain: str, email: str, reality_target: str | No
     if admin_password is not None:
         _password(admin_password, "panel.password")
     # Validate the entire startup list before generating any identities.
-    names = _user_names([f"personal@{domain}"] if user_names is None else user_names)
+    if subscription_ids not in ('random', 'names'):
+        raise ConfigError('subscription_ids must be random or names')
+    default_name = 'personal' if subscription_ids == 'names' else f'personal@{domain}'
+    names = _user_names([default_name] if user_names is None else user_names)
+    if subscription_ids == 'names' and any(not _NAMED_ID.fullmatch(name) for name in names):
+        raise ConfigError('names subscriptions require user names of 1 to 128 ASCII letters, digits, _ or -')
+    subscription_path = normalize_path(subscription_path, 'subscription.path')
+    if subscription_path.startswith('/assets/'):
+        raise ConfigError('subscription.path conflicts with the upstream assets route')
+    if panel_path is not None:
+        panel_path = normalize_path(panel_path, 'panel.path')
+        if panel_path.startswith(subscription_path) or subscription_path.startswith(panel_path):
+            raise ConfigError('panel.path and subscription.path must not overlap')
     monitoring = monitoring_settings(monitoring_mode)
     data = {
         "schema_version": SCHEMA_VERSION, "profile": profile, "domain": domain,
         "email": email, "https_port": HTTPS_PORT,
         "monitoring": monitoring,
-        "panel": {"path": f"/{secrets.token_urlsafe(18)}/", "username": "admin",
+        "panel": {"path": panel_path if panel_path is not None else f"/{secrets.token_urlsafe(18)}/", "username": "admin",
                   "password": admin_password if admin_password is not None else secrets.token_urlsafe(24)},
-        "subscription": {"path": "/sub/"},
-        "users": [{"email": name, "sub_id": secrets.token_urlsafe(18),
+        "subscription": {"path": subscription_path},
+        "users": [{"email": name, "sub_id": name if subscription_ids == 'names' else secrets.token_urlsafe(18),
                    "enable": True, "expiry_time": 0, "total_gb": 0, "limit_ip": 0}
                   for name in names],
     }
+    if subscription_ids == 'names':
+        data['subscription']['id_mode'] = 'names'
     if profile == "reality":
         # Resolve once during creation; manifests only store concrete slugs so
         # export, retries and restore never choose a different page.

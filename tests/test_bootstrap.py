@@ -126,7 +126,7 @@ PY
     def assert_not_installed(self, result):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.installs.exists())
-        self.assertFalse((self.install_root / 'releases/v0.1.0').exists())
+        self.assertFalse((self.install_root / 'releases/v0.1.1').exists())
 
     def test_success_and_piped_stdin_preserve_every_argument_without_logging_values(self):
         args = ['--profile', 'reality', '--email', 'owner@example.com', '--users-file',
@@ -135,23 +135,23 @@ PY
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records(self.installs), [args])
         self.assertNotIn(args[5], result.stdout + result.stderr)
-        release = self.install_root / 'releases/v0.1.0'
+        release = self.install_root / 'releases/v0.1.1'
         self.assertEqual((self.install_root / 'current').resolve(), release)
         self.assertEqual((release / '.archive.sha256').read_text().strip(), hashlib.sha256(self.archive.read_bytes()).hexdigest())
         events = self.records(self.events)
         self.assertEqual([event['command'] for event in events], ['curl'])
         command = events[0]['args']
-        self.assertIn('https://github.com/Dmitriy129/self-variants/releases/download/v0.1.0/vpn-installer.tar.gz', command)
+        self.assertIn('https://github.com/Dmitriy129/self-variants/releases/download/v0.1.1/vpn-installer.tar.gz', command)
         self.assertEqual(command[command.index('--proto') + 1], '=https')
         self.assertEqual(command[command.index('--proto-redir') + 1], '=https')
         self.assertIn('--retry', command)
         self.assertIn('--max-time', command)
         self.assertFalse(list(self.install_root.glob('.download.*')))
-        self.assertFalse(list((self.install_root / 'releases').glob('.v0.1.0.*')))
+        self.assertFalse(list((self.install_root / 'releases').glob('.v0.1.1.*')))
 
     def test_repeat_uses_owned_verified_release_and_passes_new_args(self):
         self.assertEqual(self.run_bootstrap('--first').returncode, 0)
-        release = self.install_root / 'releases/v0.1.0/install.sh'
+        release = self.install_root / 'releases/v0.1.1/install.sh'
         before = release.stat().st_mtime_ns
         self.archive.unlink()  # A cached run must not need the remote asset.
         result = self.run_bootstrap('--second', 'literal value')
@@ -188,7 +188,7 @@ PY
                 result = self.run_bootstrap()
                 self.assert_not_installed(result)
                 self.assertFalse((self.root / 'escaped').exists())
-                self.assertFalse(list((self.install_root / 'releases').glob('.v0.1.0.*')))
+                self.assertFalse(list((self.install_root / 'releases').glob('.v0.1.1.*')))
 
     def test_incomplete_archive_cannot_execute_its_install_script(self):
         self.build_archive(omit='vpn-installer/vpn_installer/cli.py')
@@ -215,7 +215,7 @@ PY
 
     def test_cached_release_with_wrong_marker_is_refused_without_download(self):
         self.assertEqual(self.run_bootstrap().returncode, 0)
-        release = self.install_root / 'releases/v0.1.0'
+        release = self.install_root / 'releases/v0.1.1'
         (release / '.archive.sha256').write_text('0' * 64 + '\n')
         result = self.run_bootstrap()
         self.assertNotEqual(result.returncode, 0)

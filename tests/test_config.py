@@ -11,7 +11,7 @@ from unittest import mock
 
 from vpn_installer.config import (
     ConfigError, load_instance, load_user_names, new_instance, panel_url, parse_user_names, save_instance,
-    public_origin, subscription_urls, validate_instance, vpn_domain, SITE_TEMPLATES,
+    public_origin, normalize_path, subscription_urls, validate_instance, vpn_domain, SITE_TEMPLATES,
 )
 
 
@@ -47,6 +47,131 @@ def manifest(profile="hysteria2", version=1):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_explicit_paths_wrap_only_outer_slashes_without_normalizing_content(self):
+        for raw, expected in (("app", "/app/"), ("/app", "/app/"), ("app/", "/app/"),
+                              ("/app/", "/app/"), ("family/app", "/family/app/"),
+                              ("/Admin_One/app-two/", "/Admin_One/app-two/")):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_path(raw, "subscription_path"), expected)
+        self.assertEqual(normalize_path("a" * 254, "panel_path"), "/" + "a" * 254 + "/")
+        for raw in (None, True, 123, [], "", "/", " app", "app ", "//app", "app//child",
+                    ".", "..", "../app", "app/../", "app\n", "приложение", "app%2fchild", "a" * 255):
+            with self.subTest(invalid_type=type(raw).__name__, raw=raw), self.assertRaises(ConfigError):
+                normalize_path(raw, "subscription_path")
+
+    def test_names_mode_recreates_exact_public_urls_with_fresh_credentials_for_both_profiles(self):
+        expected = {name: f"https://panel.example.com/app/{name}" for name in ("fix", "ee", "fix-vps")}
+        for profile in ("reality", "hysteria2"):
+            options = {"site_domain": "site.example.com", "site_template": "field-notes"} if profile == "reality" else {}
+            with self.subTest(profile=profile):
+                kwargs = dict(user_names=["fix", "ee", "fix-vps"], subscription_ids="names",
+                              subscription_path="app", panel_path="control", **options)
+                first = new_instance(profile, "panel.example.com", "owner@example.com", **kwargs)
+                second = new_instance(profile, "panel.example.com", "owner@example.com", **kwargs)
+                self.assertEqual(subscription_urls(first), expected)
+                self.assertEqual(subscription_urls(second), expected)
+                self.assertEqual(panel_url(first), "https://panel.example.com/control/")
+                self.assertEqual(first["subscription"], {"path": "/app/", "id_mode": "names"})
+                credential = "uuid" if profile == "reality" else "password"
+                for old, new in zip(first["users"], second["users"]):
+                    self.assertEqual(old["sub_id"], old["email"])
+                    self.assertEqual(old["sub_id"], new["sub_id"])
+                    self.assertNotEqual(old[credential], new[credential])
+                self.assertNotEqual(first["panel"]["password"], second["panel"]["password"])
+                if profile == "reality":
+                    for key in ("private_key", "public_key", "short_id"):
+                        self.assertNotEqual(first["reality"][key], second["reality"][key])
+
+    def test_names_mode_reordering_and_additions_preserve_existing_urls(self):
+        options = dict(subscription_ids="names", subscription_path="family/app", panel_path="control")
+        first = new_instance("hysteria2", "panel.example.com", "owner@example.com",
+                             user_names=["fix", "ee"], **options)
+        second = new_instance("hysteria2", "panel.example.com", "owner@example.com",
+                              user_names=["fix-vps", "ee", "fix"], **options)
+        urls = subscription_urls(second)
+        self.assertEqual({name: urls[name] for name in ("fix", "ee")}, subscription_urls(first))
+        self.assertEqual(urls["fix-vps"], "https://panel.example.com/family/app/fix-vps")
+
+    def test_invalid_names_mode_or_paths_precede_all_identity_generation(self):
+        variants = [dict(subscription_ids=value) for value in ("other", "", None, True)]
+        for field in ("subscription_path", "panel_path"):
+            variants.extend({field: value} for value in ("", "bad path", "a//b", "../a", "a" * 255))
+        variants.extend((dict(panel_path="app"), dict(panel_path="app/child"),
+                         dict(panel_path="control", subscription_path="control/child"),
+                         dict(subscription_path="assets"), dict(subscription_path="/assets/private/")))
+        variants.extend(dict(user_names=["fix", value]) for value in
+                        ("мама", "mail@example.com", "a/b", "a.b", "a" * 129))
+        with ExitStack() as stack:
+            for target in ("secrets.token_urlsafe", "secrets.token_hex", "secrets.choice", "uuid.uuid4", "_openssl"):
+                stack.enter_context(mock.patch("vpn_installer.config." + target,
+                                               side_effect=AssertionError("invalid names/path must not generate identities")))
+            for profile in ("reality", "hysteria2"):
+                for variant in variants:
+                    options = dict(subscription_ids="names", subscription_path="app", panel_path="control",
+                                   user_names=["fix", "ee"])
+                    options.update(variant)
+                    if profile == "reality":
+                        options["site_domain"] = "site.example.com"
+                    with self.subTest(profile=profile, variant=variant), self.assertRaises(ConfigError):
+                        new_instance(profile, "panel.example.com", "owner@example.com", **options)
+
+    def test_names_marker_allows_short_ids_but_legacy_random_validation_stays_strict(self):
+        legacy = manifest("hysteria2", 2)
+        legacy["users"][0]["sub_id"] = "x"
+        with self.assertRaises(ConfigError):
+            validate_instance(legacy)
+        named = copy.deepcopy(legacy)
+        named["subscription"]["id_mode"] = "names"
+        self.assertEqual(validate_instance(named), named)
+        for mode in ("random", "other", "", None, True):
+            invalid = copy.deepcopy(named)
+            invalid["subscription"]["id_mode"] = mode
+            with self.subTest(mode=mode), self.assertRaises(ConfigError):
+                validate_instance(invalid)
+        invalid = copy.deepcopy(named)
+        invalid["subscription"]["unexpected"] = "names"
+        with self.assertRaises(ConfigError):
+            validate_instance(invalid)
+        for token in ("", "мама", "a/b", "a.b", "two names", "x" * 129):
+            invalid = copy.deepcopy(named)
+            invalid["users"][0]["sub_id"] = token
+            with self.subTest(token=token), self.assertRaises(ConfigError):
+                validate_instance(invalid)
+        named["users"][0]["sub_id"] = "x" * 128
+        self.assertEqual(validate_instance(named), named)
+        named['subscription']['path'] = '/assets/private/'
+        with self.assertRaises(ConfigError):
+            validate_instance(named)
+
+    def test_names_manifest_roundtrip_preserves_urls_even_after_user_rename(self):
+        original = new_instance("hysteria2", "panel.example.com", "owner@example.com",
+                                user_names=["fix", "ee"], subscription_ids="names",
+                                subscription_path="app", panel_path="control")
+        original["users"][0]["email"] = "renamed@example.com"
+        original["users"][1]["enable"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portable.json"
+            with mock.patch("vpn_installer.config.secrets.token_urlsafe", side_effect=AssertionError("restore must not generate IDs")):
+                save_instance(path, original)
+                restored = load_instance(path)
+                self.assertEqual(restored, original)
+                self.assertEqual(subscription_urls(restored), {
+                    "renamed@example.com": "https://panel.example.com/app/fix",
+                    "ee": "https://panel.example.com/app/ee",
+                })
+
+    def test_random_mode_keeps_legacy_defaults_and_names_mode_has_safe_personal_default(self):
+        first = new_instance("hysteria2", "panel.example.com", "owner@example.com")
+        second = new_instance("hysteria2", "panel.example.com", "owner@example.com", subscription_ids="random")
+        self.assertEqual(first["subscription"], {"path": "/sub/"})
+        self.assertEqual(second["subscription"], {"path": "/sub/"})
+        self.assertEqual(first["users"][0]["email"], "personal@panel.example.com")
+        self.assertNotEqual(first["users"][0]["sub_id"], second["users"][0]["sub_id"])
+        self.assertNotEqual(first["panel"]["path"], second["panel"]["path"])
+        named = new_instance("hysteria2", "panel.example.com", "owner@example.com", subscription_ids="names")
+        self.assertEqual(named["users"][0]["email"], "personal")
+        self.assertEqual(named["users"][0]["sub_id"], "personal")
+
     def test_cli_names_trim_separators_and_keep_valid_identifiers(self):
         names = parse_user_names(" owner , мама,sister-phone,guest@example.org ")
         self.assertEqual(names, ["owner", "мама", "sister-phone", "guest@example.org"])

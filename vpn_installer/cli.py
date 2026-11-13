@@ -48,6 +48,12 @@ def parser():
     users.add_argument('--users-file', type=Path,
                        help='JSON со стартовым списком пользователей; по умолчанию users.json или users.example.json')
     users.add_argument('--users', help='имена стартовых пользователей через запятую; например owner,family-1,family-2')
+    p.add_argument('--subscription-ids', choices=('random', 'names'), default='random',
+                   help='первая установка: random — случайные ID; names — имя пользователя в URL подписки')
+    p.add_argument('--subscription-path', default='/sub/',
+                   help='первая установка: постоянный префикс подписок, например private-prefix или /private-prefix/')
+    p.add_argument('--panel-path',
+                   help='первая установка: постоянный путь панели; без параметра создаётся случайный')
     p.add_argument('--monitoring', choices=('basic', 'destinations'),
                    help='первая установка: basic по умолчанию; destinations добавляет журнал назначений')
     p.add_argument('--log-user', help='имя клиента для --show-logs')
@@ -136,13 +142,19 @@ def show_result(instance, show_password=False):
     if show_password:
         lines.append(f'Пароль: {instance["panel"]["password"]}')
     lines.extend(f'Подписка {email}: {url}' for email, url in subscription_urls(instance).items())
-    lines.append(f'Переносимый файл: {STATE_DIR / "instance.json"}. Сохраните копию вне VPS.')
+    lines.append(f'Файл для полного восстановления: {STATE_DIR / "instance.json"}.')
+    if instance['subscription'].get('id_mode') == 'names':
+        lines.append('Для повторения стартовых ссылок на новом VPS используйте те же домен, '
+                     '--subscription-path, --subscription-ids names и имена пользователей.')
+        lines.append('После переключения DNS клиент получит новые параметры при обновлении подписки; '
+                     'автоматическое обновление зависит от настроек приложения.')
     lines.extend([
         '', 'Что дальше:',
         '1. Откройте адрес «Панель» целиком, включая путь, и войдите под указанным администратором.',
         '2. В v2rayNG добавьте группу подписки с URL из строки «Подписка», обновите её и выберите профиль.',
         '3. Для subs-resolver используйте тот же URL подписки как HTTP-источник.',
-        '4. Сохраните instance.json вне VPS; после изменения пользователей экспортируйте его заново:',
+        '4. Для полного переноса пользователей, ключей и лимитов сохраните instance.json вне VPS; '
+        'после изменений в панели экспортируйте его заново:',
         f'   sudo bash {shlex.quote(str(project_dir / "install.sh"))} --export-config /root/instance.json',
         f'Инструкция: {project_dir / "README.md"}. Данные администратора хранятся в instance.json.',
     ])
@@ -337,7 +349,9 @@ def deploy(args, supplied=None):
             user_names = load_user_names(args.users_file or default_users)
         instance = new_instance(args.profile, domain, email, site_domain=site_domain,
                                 site_template=site_template, user_names=user_names,
-                                monitoring_mode=args.monitoring or 'basic')
+                                monitoring_mode=args.monitoring or 'basic',
+                                subscription_ids=args.subscription_ids,
+                                subscription_path=args.subscription_path, panel_path=args.panel_path)
 
     if not managed:
         system.check_clean_host(instance)
