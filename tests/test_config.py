@@ -47,6 +47,38 @@ def manifest(profile="hysteria2", version=1):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_fingerprint_defaults_and_explicit_choices(self):
+        for value in (None, 'chrome', 'firefox', 'hellochrome_155'):
+            with self.subTest(value=value):
+                data = new_instance('reality', 'panel.example.com', 'owner@example.com',
+                                    site_domain='site.example.com', fingerprint=value)
+                self.assertEqual(data['reality']['fingerprint'], value or 'firefox')
+        with self.assertRaises(ConfigError):
+            new_instance('hysteria2', 'panel.example.com', 'owner@example.com', fingerprint='firefox')
+
+    def test_fingerprint_migration_preserves_legacy_and_host_override(self):
+        for version in (1, 2):
+            data = manifest('reality', version)
+            self.assertEqual(validate_instance(data), data)
+            self.assertNotIn('fingerprint', validate_instance(data)['reality'])
+            data['reality']['fingerprint'] = 'firefox'
+            if version == 2:
+                data['reality']['host_fingerprint'] = 'hellochrome_155'
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'instance.json'
+                save_instance(path, data)
+                self.assertEqual(load_instance(path), data)
+        for field in ('fingerprint', 'host_fingerprint'):
+            for bad in ('', None, False, 123, [], 'firefox\n', ' Firefox', 'файрфокс', 'a' * 65):
+                data = manifest('reality', 2)
+                data['reality'][field] = bad
+                with self.subTest(field=field, bad=bad), self.assertRaises(ConfigError):
+                    validate_instance(data)
+        data = manifest('reality', 1)
+        data['reality']['host_fingerprint'] = 'firefox'
+        with self.assertRaises(ConfigError):
+            validate_instance(data)
+
     def test_explicit_paths_wrap_only_outer_slashes_without_normalizing_content(self):
         for raw, expected in (("app", "/app/"), ("/app", "/app/"), ("app/", "/app/"),
                               ("/app/", "/app/"), ("family/app", "/family/app/"),

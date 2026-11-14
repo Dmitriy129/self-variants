@@ -44,6 +44,8 @@ def parser():
     p.add_argument('--site-domain', help='отдельный домен сайта и REALITY на том же VPS')
     p.add_argument('--site-template', choices=('random', *SITE_TEMPLATES),
                    help='шаблон сайта; по умолчанию random, результат сохраняется в instance.json')
+    p.add_argument('--fingerprint',
+                   help='первая установка REALITY: uTLS-отпечаток, по умолчанию firefox; затем менять в панели')
     users = p.add_mutually_exclusive_group()
     users.add_argument('--users-file', type=Path,
                        help='JSON со стартовым списком пользователей; по умолчанию users.json или users.example.json')
@@ -131,6 +133,9 @@ def show_result(instance, show_password=False):
     lines = [f'Панель: {panel_url(instance)}', f'Администратор: {instance["panel"]["username"]}']
     if instance.get('site'):
         lines.append(f'Сайт: https://{instance["site"]["domain"]}/ (шаблон {instance["site"]["template"]})')
+    if instance['profile'] == 'reality':
+        reality = instance['reality']
+        lines.append('Отпечаток в подписке: ' + reality.get('host_fingerprint', reality.get('fingerprint', 'chrome')))
     if instance.get('monitoring'):
         settings = instance['monitoring']
         lines.append(f'Мониторинг: {settings["mode"]}. Трафик и недавние IP — в карточке клиента.')
@@ -351,7 +356,8 @@ def deploy(args, supplied=None):
                                 site_template=site_template, user_names=user_names,
                                 monitoring_mode=args.monitoring or 'basic',
                                 subscription_ids=args.subscription_ids,
-                                subscription_path=args.subscription_path, panel_path=args.panel_path)
+                                subscription_path=args.subscription_path, panel_path=args.panel_path,
+                                fingerprint=args.fingerprint)
 
     if not managed:
         system.check_clean_host(instance)
@@ -423,6 +429,9 @@ def main(argv=None):
     try:
         # Validate restores before any installation, lock-file, package or firewall mutation.
         supplied = load_instance(args.config) if args.config else None
+        if args.fingerprint is not None and args.profile != 'reality':
+            raise system.InstallError('--fingerprint применяется только с --profile reality; '
+                                      'при --config используется отпечаток из файла.')
         if args.check_config:
             instance = load_instance(args.check_config)
             print(f'Файл корректен: {instance["profile"]}, {instance["domain"]}. Секреты не изменены.')

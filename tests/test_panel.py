@@ -59,7 +59,8 @@ def imported_hosts(inbound):
     return [{"id": 17, "groupId": "generated-db-id", "inboundId": inbound["id"],
              "address": proxy["dest"], "port": proxy["port"], "security": proxy["forceTls"],
              "remark": proxy["remark"], "isDisabled": False, "isHidden": False,
-             "randomCount": 1, "snis": None, "tags": None, "finalMask": None}
+             "randomCount": 1, "snis": None, "tags": None, "finalMask": None,
+             "fingerprint": proxy.get("fingerprint", "")}
             for proxy in stream.get("externalProxy", [])]
 
 
@@ -328,6 +329,58 @@ class PanelHTTPTests(unittest.TestCase):
             configure_instance(client, config)
             self.assertFalse(any(path.endswith(("/add", "/update"))
                                  for _, path, _ in state["requests"][count:]))
+
+    def test_live_inbound_fingerprint_survives_export_and_fresh_restore(self):
+        for version in (1, 2):
+            baseline = manifest('reality', version)
+            for fp in ('firefox', 'hellochrome_155'):
+                with self.subTest(version=version, fp=fp), panel_peer(live_state('reality', version)) as (client, state):
+                    state['inbounds'][0]['streamSettings']['realitySettings']['settings']['fingerprint'] = fp
+                    exported = export_instance(client.login(), baseline)
+                    self.assertEqual(exported['reality']['fingerprint'], fp)
+                    self.assertEqual(exported['users'], baseline['users'])
+                    self.assertEqual(exported['subscription'], baseline['subscription'])
+                    before = len(state['requests'])
+                    configure_instance(client, exported)
+                    self.assertFalse(any(path.endswith(('/add', '/update')) for _, path, _ in state['requests'][before:]))
+                with panel_peer() as (client, state):
+                    created = configure_instance(client.login(), exported)
+                    state['clients'] = [normalized_user(inboundIds=[created['id']])]
+                    self.assertEqual(export_instance(client, exported), exported)
+
+    def test_host_override_preserves_inheritance_and_clearing(self):
+        baseline = manifest('reality', 2)
+        with panel_peer(live_state('reality', 2)) as (client, state):
+            state['hosts'][0]['fingerprint'] = 'firefox'
+            exported = export_instance(client.login(), baseline)
+            self.assertNotIn('fingerprint', exported['reality'])  # Legacy inbound remains chrome.
+            self.assertEqual(exported['reality']['host_fingerprint'], 'firefox')
+            configure_instance(client, exported)  # Stale inline externalProxy is not authoritative.
+            self.assertEqual(export_instance(client, exported), exported)
+        with panel_peer() as (client, state):
+            created = configure_instance(client.login(), exported)
+            state['clients'] = [normalized_user(inboundIds=[created['id']])]
+            self.assertEqual(state['hosts'][0]['fingerprint'], 'firefox')
+            self.assertEqual(export_instance(client, exported), exported)
+            state['hosts'][0]['fingerprint'] = ''
+            stream = json.loads(state['inbounds'][0]['streamSettings'])
+            stream['realitySettings']['settings']['fingerprint'] = 'hellochrome_155'
+            state['inbounds'][0]['streamSettings'] = json.dumps(stream)
+            cleared = export_instance(client, exported)
+            self.assertNotIn('host_fingerprint', cleared['reality'])
+            self.assertEqual(cleared['reality']['fingerprint'], 'hellochrome_155')
+            configure_instance(client, cleared)
+            self.assertEqual(export_instance(client, cleared), cleared)
+
+    def test_invalid_live_fingerprint_is_rejected(self):
+        for where in ('host', 'inbound'):
+            for value in (False, 17, ' Firefox', 'firefox\n'):
+                state = live_state('reality', 2)
+                target = state['hosts'][0] if where == 'host' else state['inbounds'][0]['streamSettings']['realitySettings']['settings']
+                target['fingerprint'] = value
+                with self.subTest(where=where, value=value), panel_peer(state) as (client, _):
+                    with self.assertRaises(PanelError):
+                        export_instance(client.login(), manifest('reality', 2))
 
     def test_both_v2_profiles_export_exact_identity_without_explicit_443(self):
         for profile in ("reality", "hysteria2"):

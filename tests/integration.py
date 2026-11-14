@@ -157,6 +157,10 @@ def test_instance(profile, version):
             instance["reality"].update(target=f"{TARGET}:9443", server_name=TARGET)
     else:
         instance['monitoring']['mode'] = 'destinations'
+        if profile == 'reality':
+            # Cover Host override precedence separately from v1's inbound firefox.
+            instance['reality']['fingerprint'] = 'chrome'
+            instance['reality']['host_fingerprint'] = 'firefox'
     # Test multiple independently portable users and both boolean states.
     for index in (2, 3):
         user = copy.deepcopy(instance["users"][0])
@@ -203,6 +207,10 @@ def get_subscription(instance, user):
         raise RuntimeError("subscription address or identity differs from the manifest")
     if uri.scheme not in (("vless",) if instance["profile"] == "reality" else ("hysteria2", "hy2")):
         raise RuntimeError("subscription uses an unexpected protocol")
+    if instance['profile'] == 'reality':
+        expected_fp = instance['reality'].get('host_fingerprint', instance['reality'].get('fingerprint', 'chrome'))
+        if urllib.parse.parse_qs(uri.query).get('fp') != [expected_fp]:
+            raise RuntimeError('subscription fingerprint differs from the live portable settings')
     return uris[0]
 
 

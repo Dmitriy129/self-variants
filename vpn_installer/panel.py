@@ -12,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .config import LOCAL_REALITY_TARGET, public_origin, vpn_domain
+from .config import ConfigError, LOCAL_REALITY_TARGET, public_origin, validate_fingerprint, vpn_domain
 
 
 ACCESS_LOG_PATH = "/var/log/x-ui/access.log"
@@ -214,8 +214,29 @@ def _local_site(instance):
 
 
 def _external_proxy(instance):
-    return [{"dest": vpn_domain(instance), "port": 443, "forceTls": "same",
-             "remark": "vpn-installer-reality"}]
+    proxy = {"dest": vpn_domain(instance), "port": 443, "forceTls": "same",
+             "remark": "vpn-installer-reality"}
+    if "host_fingerprint" in instance.get("reality", {}):
+        proxy["fingerprint"] = _fingerprint(instance["reality"]["host_fingerprint"])
+    return [proxy]
+
+
+def _fingerprint(value):
+    try:
+        return validate_fingerprint(value)
+    except ConfigError as exc:
+        raise PanelError(str(exc)) from None
+
+
+def _without_host_fingerprint(stream):
+    """Inline proxy data can be stale: 3x-ui's Hosts table is authoritative."""
+    result = deepcopy(stream)
+    proxies = result.get("externalProxy", [])
+    if not isinstance(proxies, list) or any(not isinstance(row, dict) for row in proxies):
+        raise PanelError("Invalid advertised hosts")
+    for row in proxies:
+        row.pop("fingerprint", None)
+    return result
 
 
 def instance_settings(instance):
@@ -346,7 +367,8 @@ def build_inbound(instance):
                 "show": False, "xver": 0, "target": reality["target"],
                 "serverNames": [reality["server_name"]],
                 "privateKey": reality["private_key"], "shortIds": [reality["short_id"]],
-                "settings": {"publicKey": reality["public_key"], "fingerprint": "chrome",
+                "settings": {"publicKey": reality["public_key"],
+                             "fingerprint": _fingerprint(reality.get("fingerprint", "chrome")),
                              "serverName": reality["server_name"], "spiderX": "/"},
             },
         }
@@ -413,7 +435,8 @@ def _one_inbound(inbounds, instance):
         if _local_site(instance):
             reality = _json_object(stream.get("realitySettings"), "realitySettings")
             if (stream.get("sockopt") != {"acceptProxyProtocol": True}
-                    or stream.get("externalProxy") != _external_proxy(instance)
+                    or _without_host_fingerprint(stream).get("externalProxy") !=
+                    _without_host_fingerprint({"externalProxy": _external_proxy(instance)})["externalProxy"]
                     or reality.get("target") != LOCAL_REALITY_TARGET
                     or reality.get("serverNames") != [vpn_domain(instance)]
                     or reality.get("xver", 0) != 0):
@@ -448,13 +471,17 @@ def _validate_hosts(client, instance, inbound):
     # cannot be represented by schema 2. Ignore only row identity/timestamps.
     unsupported = (
         "serverDescription", "tags", "sni", "snis", "sniSharedRandom", "hostHeader", "path",
-        "alpn", "fingerprint", "cipherSuites", "overrideSniFromAddress", "keepSniBlank",
+        "alpn", "cipherSuites", "overrideSniFromAddress", "keepSniBlank",
         "pinnedPeerCertSha256", "verifyPeerCertByName", "allowInsecure", "echConfigList",
         "muxParams", "sockoptParams", "finalMask", "vlessRoute", "excludeFromSubTypes",
         "mihomoIpVersion", "mihomoX25519", "shuffleHost", "nodeGuids",
     )
     if any(host.get(field) for field in unsupported):
         raise PanelError("Managed host overrides cannot be represented by the portable configuration")
+    fingerprint = host.get("fingerprint")
+    if fingerprint not in (None, ""):
+        return _fingerprint(fingerprint)
+    return None
 
 
 def configure_instance(client, instance):
@@ -464,9 +491,11 @@ def configure_instance(client, instance):
     if existing:
         inbound, _, stream = _one_inbound(existing, instance)
         expected_stream = json.loads(expected["streamSettings"])
-        if stream != expected_stream or inbound.get("shareAddr") != vpn_domain(instance):
+        if (_without_host_fingerprint(stream) != _without_host_fingerprint(expected_stream)
+                or inbound.get("shareAddr") != vpn_domain(instance)):
             raise PanelError("Existing inbound differs; export its current configuration first")
-        _validate_hosts(client, instance, inbound)
+        if _validate_hosts(client, instance, inbound) != instance.get("reality", {}).get("host_fingerprint"):
+            raise PanelError("Host fingerprint differs; export its current configuration first")
         desired = instance_settings(instance)
         live = client.get_settings()
         if any(live.get(key) != value for key, value in desired.items()):
@@ -480,7 +509,8 @@ def configure_instance(client, instance):
     client.save_settings(instance_settings(instance))
     apply_monitoring(client, instance)
     inbound = client.add_inbound(expected)
-    _validate_hosts(client, instance, inbound)
+    if _validate_hosts(client, instance, inbound) != instance.get("reality", {}).get("host_fingerprint"):
+        raise PanelError("Panel did not preserve the Host fingerprint")
     return inbound
 
 
@@ -500,7 +530,7 @@ def export_instance(client, baseline):
     if any(live.get(field) != expected[field] for field in layout_fields):
         raise PanelError("Panel listener or public URL layout changed; restore the managed settings before export")
     inbound, _, stream = _one_inbound(client.list_inbounds(), baseline)
-    _validate_hosts(client, baseline, inbound)
+    host_fingerprint = _validate_hosts(client, baseline, inbound)
     monitoring = validate_monitoring(client, baseline)
     if monitoring is not None:
         result["monitoring"] = monitoring
@@ -537,6 +567,13 @@ def export_instance(client, baseline):
             "public_key": _nonempty_string(client_settings.get("publicKey"), "public_key"),
             "short_id": _nonempty_string(ids[0], "short_id"),
         }
+        fingerprint = client_settings.get("fingerprint")
+        fingerprint = "chrome" if fingerprint in (None, "") else _fingerprint(fingerprint)
+        # Absence in legacy manifests means chrome, never the new-install default.
+        if "fingerprint" in baseline["reality"] or fingerprint != "chrome":
+            result["reality"]["fingerprint"] = fingerprint
+        if host_fingerprint is not None:
+            result["reality"]["host_fingerprint"] = host_fingerprint
     else:
         tls = _json_object(stream.get("tlsSettings"), "tlsSettings")
         cert_dir = "/etc/letsencrypt/live/" + result["domain"]

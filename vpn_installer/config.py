@@ -280,7 +280,15 @@ def validate_instance(data: Any) -> dict:
         credentials.add(user[credential])
 
     if profile == "reality":
-        reality = _fields(data["reality"], {"target", "server_name", "private_key", "public_key", "short_id"}, "reality")
+        reality_fields = {"target", "server_name", "private_key", "public_key", "short_id"}
+        if isinstance(data["reality"], dict):
+            reality_fields |= data["reality"].keys() & {"fingerprint", "host_fingerprint"}
+        reality = _fields(data["reality"], reality_fields, "reality")
+        for field in ("fingerprint", "host_fingerprint"):
+            if field in reality:
+                validate_fingerprint(reality[field])
+        if version == 1 and "host_fingerprint" in reality:
+            raise ConfigError("host_fingerprint requires schema 2 with a managed Host")
         if version == 1:
             _target(reality["target"])
         elif reality["target"] != LOCAL_REALITY_TARGET:
@@ -308,11 +316,19 @@ def normalize_path(value: str, field: str) -> str:
     return path
 
 
+def validate_fingerprint(value: Any) -> str:
+    """Keep named uTLS presets portable, without inventing/normalizing a choice."""
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value, re.ASCII):
+        raise ConfigError("fingerprint must be a nonempty lowercase uTLS preset name (max 64 characters)")
+    return value
+
+
 def new_instance(profile: str, domain: str, email: str, reality_target: str | None = None,
                  admin_password: str | None = None, *, site_domain: str | None = None,
                  site_template: str | None = None, user_names: list[str] | None = None,
                  monitoring_mode: str = "basic", subscription_ids: str = "random",
-                 subscription_path: str = "/sub/", panel_path: str | None = None) -> dict:
+                 subscription_path: str = "/sub/", panel_path: str | None = None,
+                 fingerprint: str | None = None) -> dict:
     """Create a schema 2 deployment. Existing schema 1 files are restore-only."""
     if profile not in ("reality", "hysteria2"):
         raise ConfigError("profile must be reality or hysteria2")
@@ -321,6 +337,7 @@ def new_instance(profile: str, domain: str, email: str, reality_target: str | No
     if reality_target is not None:
         raise ConfigError("new deployments use a local site; reality_target is only stored in legacy manifests")
     if profile == "reality":
+        fingerprint = validate_fingerprint("firefox" if fingerprint is None else fingerprint)
         _domain(site_domain, "site.domain")
         if site_domain == domain:
             raise ConfigError("site.domain must differ from the management domain")
@@ -328,6 +345,8 @@ def new_instance(profile: str, domain: str, email: str, reality_target: str | No
             raise ConfigError("site.template must name a built-in site template")
     elif site_domain is not None or site_template is not None:
         raise ConfigError("site options are only supported for the reality profile")
+    elif fingerprint is not None:
+        raise ConfigError("fingerprint is only supported for the reality profile")
     if admin_password is not None:
         _password(admin_password, "panel.password")
     # Validate the entire startup list before generating any identities.
@@ -368,7 +387,7 @@ def new_instance(profile: str, domain: str, email: str, reality_target: str | No
         data["reality"] = {"target": LOCAL_REALITY_TARGET, "server_name": site_domain,
                            "private_key": _encode_key(private),
                            "public_key": _encode_key(_public_from_private(private)),
-                           "short_id": secrets.token_hex(8)}
+                           "short_id": secrets.token_hex(8), "fingerprint": fingerprint}
         for user in data["users"]:
             user["uuid"] = str(uuid.uuid4())
     else:

@@ -89,6 +89,8 @@ class MainBoundaryTests(unittest.TestCase):
 
     def test_monitoring_and_log_arguments_are_checked_before_host_changes(self):
         for argv in (["--status", "--monitoring", "destinations"],
+                     ["--status", "--fingerprint", "firefox"],
+                     ["--profile", "hysteria2", "--fingerprint", "firefox"],
                      ["--show-logs", "--log-lines", "0"],
                      ["--show-logs", "--log-lines", "10001"],
                      ["--status", "--log-user", "alice"]):
@@ -302,6 +304,20 @@ class DeploySequenceTests(unittest.TestCase):
         self.assertEqual(saved["subscription"], {"path": "/app/", "id_mode": "names"})
         self.assertEqual(saved["panel"]["path"], "/control/")
         self.assertEqual([user["sub_id"] for user in saved["users"]], ["fix", "ee", "fix-vps"])
+
+    def test_fingerprint_flag_applies_only_to_fresh_reality(self):
+        args = cli.parser().parse_args(['--profile', 'reality', '--domain', 'vpn.example.com',
+            '--email', 'owner@example.com', '--site-domain', 'site.example.com',
+            '--users', 'owner', '--fingerprint', 'hellochrome_155'])
+        cli.deploy(args)
+        saved = self.mocks['save_instance'].call_args.args[1]
+        self.assertEqual(saved['reality']['fingerprint'], 'hellochrome_155')
+        self.mocks['read_state'].return_value = {'phase': 'complete'}
+        self.mocks['load_instance'].return_value = saved
+        args.fingerprint = 'firefox'
+        with mock.patch.object(cli, 'new_instance', side_effect=AssertionError('must not replace live state')):
+            cli.deploy(args)
+        self.assertEqual(self.mocks['export_live'].call_args.args[0]['reality']['fingerprint'], 'hellochrome_155')
 
     def test_same_named_subscription_command_on_two_clean_states_recreates_urls(self):
         args = self.new_args("--users", "fix,ee,fix-vps", "--subscription-ids", "names",
