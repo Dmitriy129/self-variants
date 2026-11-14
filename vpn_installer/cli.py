@@ -16,9 +16,9 @@ import time
 import urllib.error
 
 from .config import (ConfigError, load_instance, load_user_names, new_instance, panel_url, parse_user_names,
-                     save_instance, subscription_urls, SITE_TEMPLATES)
+                     save_instance, subscription_urls, validate_fingerprint, SITE_TEMPLATES)
 from . import monitoring, network, system
-from .panel import (PanelClient, apply_monitoring, configure_instance, export_instance,
+from .panel import (PanelClient, apply_fingerprint, apply_monitoring, configure_instance, export_instance,
                     validate_monitoring)
 
 STATE_DIR = system.STATE_DIR
@@ -36,6 +36,7 @@ def parser():
     mode.add_argument('--backup', action='store_true', help='сохранить БД, настройки и переносимый JSON')
     mode.add_argument('--status', action='store_true', help='проверить сервисы и доступ к панели')
     mode.add_argument('--update', action='store_true', help='явно установить версии из versions.json после backup')
+    mode.add_argument('--set-fingerprint', help='сменить отпечаток REALITY для всех пользователей готовой установки')
     mode.add_argument('--set-monitoring', choices=('basic', 'destinations'),
                       help='сменить режим мониторинга установленного сервера без изменения пользователей')
     mode.add_argument('--show-logs', action='store_true', help='показать последние записи архива подключений')
@@ -194,7 +195,42 @@ def maintain(args, state):
     if not state or state.get('phase') != 'complete':
         raise system.InstallError('Сначала завершите установку.')
     instance = load_instance(STATE_DIR / 'instance.json')
-    if args.show_logs:
+    if args.set_fingerprint is not None:
+        if instance['profile'] != 'reality':
+            raise system.InstallError('--set-fingerprint используется только для REALITY.')
+        fingerprint = validate_fingerprint(args.set_fingerprint)
+        live = export_and_backup(instance)
+        target = deepcopy(live)
+        target['reality']['fingerprint'] = fingerprint
+        if 'host_fingerprint' in target['reality']:
+            target['reality']['host_fingerprint'] = fingerprint
+        try:
+            apply_fingerprint(connected_panel(live), target)
+            system.run(['systemctl', 'restart', 'x-ui'])
+            client = connected_panel(target, attempts=40)
+            verify_services(target)
+            actual = export_instance(client, target)
+            if actual != target:
+                raise system.InstallError('Панель не подтвердила смену отпечатка с сохранением настроек.')
+            save_instance(STATE_DIR / 'instance.json', actual)
+        except Exception:
+            try:
+                apply_fingerprint(connected_panel(live, attempts=40), live)
+                system.run(['systemctl', 'restart', 'x-ui'])
+                client = connected_panel(live, attempts=40)
+                verify_services(live)
+                restored = export_instance(client, live)
+                if restored['reality'] != live['reality']:
+                    raise system.InstallError('Отпечаток не восстановлен.')
+                save_instance(STATE_DIR / 'instance.json', restored)
+            except Exception:
+                raise system.InstallError('Смена отпечатка не завершилась, откат не подтверждён. '
+                                          f'Резервная копия находится в {STATE_DIR / "backups"}.') from None
+            raise
+        print(f'Отпечаток всех профилей REALITY: {fingerprint}. Пользователи и ссылки сохранены.')
+        print('На каждом устройстве обновите подписку и переподключитесь. '
+              'Ранее импортированные статические профили нужно обновить вручную.')
+    elif args.show_logs:
         if 'monitoring' not in instance:
             raise system.InstallError('В этой старой конфигурации архив мониторинга не настроен.')
         lines = deque(monitoring.history_lines(instance['monitoring'], user=args.log_user), maxlen=args.log_lines)
@@ -429,6 +465,8 @@ def main(argv=None):
     try:
         # Validate restores before any installation, lock-file, package or firewall mutation.
         supplied = load_instance(args.config) if args.config else None
+        if args.set_fingerprint is not None:
+            validate_fingerprint(args.set_fingerprint)
         if args.fingerprint is not None and args.profile != 'reality':
             raise system.InstallError('--fingerprint применяется только с --profile reality; '
                                       'при --config используется отпечаток из файла.')

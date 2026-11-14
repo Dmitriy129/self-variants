@@ -91,6 +91,8 @@ class MainBoundaryTests(unittest.TestCase):
         for argv in (["--status", "--monitoring", "destinations"],
                      ["--status", "--fingerprint", "firefox"],
                      ["--profile", "hysteria2", "--fingerprint", "firefox"],
+                     ["--set-fingerprint", "Firefox\n"],
+                     ["--set-fingerprint", ""],
                      ["--show-logs", "--log-lines", "0"],
                      ["--show-logs", "--log-lines", "10001"],
                      ["--status", "--log-user", "alice"]):
@@ -622,6 +624,72 @@ class DeploySequenceTests(unittest.TestCase):
                 self.deploy(data)
         self.mocks["export_live"].assert_not_called()
         self.mocks["run"].assert_not_called()
+
+
+class FingerprintMaintenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.stack.enter_context(mock.patch.object(cli, 'STATE_DIR', self.root))
+        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.path = self.root / 'instance.json'
+        self.saved = manifest('reality', 2)
+        save_instance(self.path, self.saved)
+        self.live = copy.deepcopy(self.saved)
+        self.live['users'][0]['enable'] = False
+        self.live['reality']['host_fingerprint'] = 'chrome'
+        self.state = {'phase': 'complete'}
+        self.args = cli.parser().parse_args(['--set-fingerprint', 'firefox'])
+        self.calls = mock.Mock()
+        self.mocks = {}
+        for name in ('connected_panel', 'export_and_backup', 'apply_fingerprint', 'verify_services', 'export_instance'):
+            self.mocks[name] = self.stack.enter_context(mock.patch.object(cli, name))
+            self.calls.attach_mock(self.mocks[name], name)
+        self.mocks['export_and_backup'].return_value = self.live
+        self.mocks['export_instance'].side_effect = lambda client, expected: copy.deepcopy(expected)
+        self.runner = self.stack.enter_context(mock.patch.object(system, 'run'))
+        self.calls.attach_mock(self.runner, 'run')
+
+    def test_change_uses_live_users_and_backups_before_api_update(self):
+        cli.maintain(self.args, self.state)
+        expected = copy.deepcopy(self.live)
+        expected['reality'].update(fingerprint='firefox', host_fingerprint='firefox')
+        self.assertEqual(load_instance(self.path), expected)
+        self.mocks['apply_fingerprint'].assert_called_once_with(self.mocks['connected_panel'].return_value, expected)
+        self.runner.assert_called_once_with(['systemctl', 'restart', 'x-ui'])
+        calls = [call[0] for call in self.calls.mock_calls]
+        self.assertLess(calls.index('export_and_backup'), calls.index('apply_fingerprint'))
+
+    def test_failed_api_or_health_rolls_back_only_fingerprints(self):
+        for failure in ('apply_fingerprint', 'verify_services'):
+            with self.subTest(failure=failure):
+                for mocked in self.mocks.values():
+                    mocked.reset_mock()
+                self.mocks[failure].side_effect = [RuntimeError('failure'), None]
+                with self.assertRaisesRegex(RuntimeError, 'failure'):
+                    cli.maintain(self.args, self.state)
+                self.assertEqual(load_instance(self.path), self.live)
+                self.assertEqual(self.mocks['apply_fingerprint'].call_args.args[1], self.live)
+                self.mocks[failure].side_effect = None
+
+    def test_failed_rollback_reports_backup_location(self):
+        self.mocks['apply_fingerprint'].side_effect = RuntimeError('unreachable')
+        with self.assertRaisesRegex(system.InstallError, 'откат не подтверждён'):
+            cli.maintain(self.args, self.state)
+        self.assertEqual(load_instance(self.path), self.saved)
+
+    def test_failed_backup_or_wrong_profile_never_changes_panel(self):
+        self.mocks['export_and_backup'].side_effect = RuntimeError('backup failed')
+        with self.assertRaisesRegex(RuntimeError, 'backup failed'):
+            cli.maintain(self.args, self.state)
+        self.mocks['apply_fingerprint'].assert_not_called()
+        save_instance(self.path, manifest('hysteria2', 2))
+        self.mocks['export_and_backup'].reset_mock()
+        with self.assertRaisesRegex(system.InstallError, 'только для REALITY'):
+            cli.maintain(self.args, self.state)
+        self.mocks['export_and_backup'].assert_not_called()
+        self.runner.assert_not_called()
 
 
 class MonitoringMaintenanceTests(unittest.TestCase):

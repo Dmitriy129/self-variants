@@ -9,7 +9,7 @@ import unittest
 import urllib.parse
 
 from vpn_installer.panel import (
-    ACCESS_LOG_PATH, PanelClient, PanelError, apply_monitoring, build_inbound, configure_instance,
+    ACCESS_LOG_PATH, PanelClient, PanelError, apply_fingerprint, apply_monitoring, build_inbound, configure_instance,
     export_instance, instance_settings, validate_monitoring,
 )
 
@@ -175,6 +175,19 @@ def panel_peer(state=None):
                 return self.reply(state["clients"])
             if route == "panel/api/hosts/raw":
                 return self.reply(state.get("hosts", []))
+            if route.startswith('panel/api/hosts/get/'):
+                host = state['hosts'][0]
+                group = dict(host, inboundIds=[host['inboundId']], hosts=[host['address']])
+                return self.reply(group)
+            if route.startswith('panel/api/hosts/update/') and self.command == 'POST':
+                state['hosts'][0]['fingerprint'] = payload['fingerprint']
+                return self.reply(state['hosts'])
+            if route.startswith('panel/api/inbounds/update/') and self.command == 'POST':
+                for field in ('settings', 'streamSettings', 'sniffing'):
+                    if isinstance(payload.get(field), str):
+                        payload[field] = json.loads(payload[field])
+                state['inbounds'][0] = payload
+                return self.reply(payload)
             if route == "panel/api/server/status":
                 return self.reply(state.get("status", {"xray": {"state": "running", "errorMsg": "",
                                                                  "version": "26.11.9"}}))
@@ -210,6 +223,35 @@ def panel_peer(state=None):
 
 
 class PanelHTTPTests(unittest.TestCase):
+    def test_fingerprint_change_preserves_users_and_host_inheritance(self):
+        for version, override in ((1, None), (2, None), (2, 'chrome')):
+            baseline = manifest('reality', version)
+            initial = live_state('reality', version)
+            initial['clients'][0].update(enable=False, expiryTime=4102444800000, totalGB=70000)
+            if override:
+                initial['hosts'][0]['fingerprint'] = override
+            with self.subTest(version=version, override=override), panel_peer(initial) as (client, state):
+                client.login()
+                before = export_instance(client, baseline)
+                target = deepcopy(before)
+                target['reality']['fingerprint'] = 'firefox'
+                if override:
+                    target['reality']['host_fingerprint'] = 'firefox'
+                apply_fingerprint(client, target)
+                self.assertEqual(export_instance(client, target), target)
+                self.assertEqual(state['clients'], initial['clients'])  # Includes traffic counters.
+                changed = deepcopy(state['inbounds'][0])
+                changed['streamSettings']['realitySettings']['settings']['fingerprint'] = 'chrome'
+                # Wire JSON representation may change; all other settings stay equal.
+                original = deepcopy(initial['inbounds'][0])
+                original['sniffing'] = json.loads(original['sniffing'])
+                self.assertEqual(changed, original)
+                count = len(state['requests'])
+                apply_fingerprint(client, target)
+                self.assertFalse(any('/update/' in path for _, path, _ in state['requests'][count:]))
+                apply_fingerprint(client, before)
+                self.assertEqual(export_instance(client, before), before)
+
     def test_monitoring_new_install_and_repeat_for_both_profiles(self):
         for profile in ("reality", "hysteria2"):
             for mode in ("basic", "destinations"):

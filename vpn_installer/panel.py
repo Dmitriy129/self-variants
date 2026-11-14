@@ -184,6 +184,21 @@ class PanelClient:
             raise PanelError("Panel did not return the created inbound")
         return result
 
+    def update_inbound(self, inbound):
+        payload = deepcopy(inbound)
+        for field in ('settings', 'streamSettings', 'sniffing'):
+            if isinstance(payload.get(field), dict):
+                payload[field] = _dump(payload[field])
+        return self._request('POST', 'panel/api/inbounds/update/' + str(inbound['id']), payload)
+
+    def get_host_group(self, group_id):
+        return _json_object(self._request('GET', 'panel/api/hosts/get/' +
+                                         urllib.parse.quote(group_id, safe='')), 'Host group')
+
+    def update_host_group(self, group):
+        return self._request('POST', 'panel/api/hosts/update/' +
+                             urllib.parse.quote(group['groupId'], safe=''), group)
+
     def restart_panel(self):
         return self._request("POST", "panel/api/setting/restartPanel", {})
 
@@ -482,6 +497,39 @@ def _validate_hosts(client, instance, inbound):
     if fingerprint not in (None, ""):
         return _fingerprint(fingerprint)
     return None
+
+
+def apply_fingerprint(client, instance):
+    """Apply only the requested fingerprints; caller owns backup/rollback/restart."""
+    if instance['profile'] != 'reality':
+        raise PanelError('Fingerprint changes require the REALITY profile')
+    fingerprint = _fingerprint(instance['reality'].get('fingerprint', 'chrome'))
+    host_fingerprint = instance['reality'].get('host_fingerprint')
+    if host_fingerprint is not None:
+        host_fingerprint = _fingerprint(host_fingerprint)
+    inbound, _, stream = _one_inbound(client.list_inbounds(), instance)
+    live_host_fingerprint = _validate_hosts(client, instance, inbound)
+    group = None
+    if _local_site(instance) and live_host_fingerprint != host_fingerprint:
+        host = client.list_hosts()[0]
+        group_id = _nonempty_string(host.get('groupId'), 'Host groupId')
+        group = client.get_host_group(group_id)
+        if (group.get('groupId') != group_id or group.get('inboundIds') != [inbound['id']]
+                or not isinstance(group.get('hosts'), list) or len(group['hosts']) != 1):
+            raise PanelError('Managed Host group changed; refusing to replace other endpoints')
+        group['fingerprint'] = host_fingerprint or ''
+    stream = deepcopy(stream)
+    settings = _json_object(stream['realitySettings'].get('settings'), 'REALITY client settings')
+    if settings.get('fingerprint') != fingerprint:
+        settings['fingerprint'] = fingerprint
+        stream['realitySettings']['settings'] = settings
+        payload = deepcopy(inbound)
+        payload['streamSettings'] = _dump(stream)
+        # Keep externalProxy byte-for-byte equivalent: editing it can trigger
+        # upstream's legacy Host import. Only the normalized Hosts API owns overrides.
+        client.update_inbound(payload)
+    if group is not None:
+        client.update_host_group(group)
 
 
 def configure_instance(client, instance):

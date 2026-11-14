@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vpn_installer.config import new_instance, validate_instance, subscription_urls, vpn_domain
 from vpn_installer import monitoring
 from vpn_installer.network import render_nginx, render_stream, install_static_site
-from vpn_installer.panel import PanelClient, apply_monitoring, configure_instance, export_instance, validate_monitoring
+from vpn_installer.panel import PanelClient, apply_fingerprint, apply_monitoring, configure_instance, export_instance, validate_monitoring
 from vpn_installer.system import digest_file, download_artifacts, install_binaries, read_versions
 
 
@@ -300,6 +300,22 @@ def configure_export(app, work, profile, instance, number):
         exported = validate_instance(export_instance(client, instance))
         if exported != instance:
             raise RuntimeError("API export did not preserve all portable identities and limits")
+        if profile == 'reality' and number == 1:
+            changed = copy.deepcopy(instance)
+            changed['reality']['fingerprint'] = ('chrome' if instance['reality'].get('fingerprint') == 'firefox'
+                                                 else 'firefox')
+            if 'host_fingerprint' in changed['reality']:
+                changed['reality']['host_fingerprint'] = 'chrome'
+            apply_fingerprint(client, changed)
+            if export_instance(client, changed) != changed:
+                raise RuntimeError('fingerprint update changed users or other portable settings')
+            for user in changed['users']:
+                if user['enable']:
+                    wait_for(lambda user=user: get_subscription(changed, user), 'changed fingerprint subscription', process)
+            apply_fingerprint(client, instance)
+            if export_instance(client, instance) != instance:
+                raise RuntimeError('fingerprint rollback changed portable settings')
+            print(f"PASS: v{instance['schema_version']} REALITY: live fingerprint change, subscription fp and rollback preserved users", flush=True)
         subscriptions = {}
         for user in instance["users"]:
             if user["enable"]:
